@@ -4,6 +4,29 @@ Eine eigenständige Home-Assistant-Lovelace-Karte (`custom:pv-cockpit-card`) fü
 
 ---
 
+## Beispiele: Prognose vs. Ist
+
+Alle drei Ansichten stammen direkt aus einer kalibrierten Multi-String-Anlage (`Ideal (klar)` unabhängig vom Modus, `Prognose` vs. tatsächlicher `Ist`-Verlauf):
+
+<table>
+  <tr>
+    <td align="center">
+      <img src="docs/images/pv_cockpit_bewoelkt_so_22_11.png" alt="Stark bewölkter Tag (So 22.11.)" width="100%" /><br />
+      <sub><strong>Stark bewölkt (So 22.11.)</strong> · Prognose ~8.9 kWh · Ist 7.86 kWh (-11%)</sub>
+    </td>
+    <td align="center">
+      <img src="docs/images/pv_cockpit_wechselhaft_gestern.png" alt="Wechselhafter Tag (Gestern)" width="100%" /><br />
+      <sub><strong>Wechselhaft (Gestern)</strong> · Prognose ~12.0 kWh · Ist 13.17 kWh (+9%)</sub>
+    </td>
+    <td align="center">
+      <img src="docs/images/pv_cockpit_sonnentag_heute.png" alt="Klarer Sonnentag (Heute)" width="100%" /><br />
+      <sub><strong>Klarer Sonnentag (Heute)</strong> · Ideal ~25.4 kWh · Ist 24.77 kWh</sub>
+    </td>
+  </tr>
+</table>
+
+---
+
 ## Highlights
 
 - **Pro-String-PV-Modell:** Beliebig viele Strings/Dachflächen mit individueller Modulanzahl, Modulleistung (`Wp`), Ausrichtung (`Azimut 0–360°`), Neigung (`0–90°`), eigenem `Ist`-Sensor und string-spezifischer Verschattung.
@@ -23,7 +46,7 @@ Eine eigenständige Home-Assistant-Lovelace-Karte (`custom:pv-cockpit-card`) fü
 
 ### Variante 1: Manuelle Installation (empfohlen bis HACS-Aufnahme)
 
-1. Lade die Datei [`pv-cockpit-card.js`](public/local/pv-cockpit-card.js) herunter und lege sie in Home Assistant unter:
+1. Lade die Datei [`pv-cockpit-card.js`](pv-cockpit-card.js) herunter und lege sie in Home Assistant unter:
    ```text
    /config/www/pv-cockpit-card.js
    ```
