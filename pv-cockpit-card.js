@@ -5094,6 +5094,7 @@
       for (const slot of slots) {
         const hCenter = this._isoHourToUtcMs(slot.iso, utcOffsetSec);
         if (!Number.isFinite(hCenter)) continue;
+        if (isTargetToday && hCenter > nowMs) continue;
         const wStart = hCenter - 1800000;
         if (wStart >= maxSlotEndMs) continue;
         const wEnd = Math.min(hCenter + 1800000, maxSlotEndMs);
@@ -5107,11 +5108,22 @@
         }
       }
 
+      let nowWatts = livePowerWatts;
+      if (isTargetToday && nowWatts === null && Number.isFinite(dayStartMs) && nowMs > dayStartMs) {
+        const recentStart = Math.max(dayStartMs, nowMs - 1800000);
+        const recentRes =
+          unitType === 'power'
+            ? integratePowerWindow(recentStart, nowMs)
+            : computeEnergyWindow(recentStart, nowMs);
+        if (recentRes) nowWatts = recentRes.avgWatts;
+      }
+
       return {
         entityId,
         friendlyName: hist?.friendlyName || String(attrs.friendly_name || entityId),
         unitType,
         livePowerWatts,
+        nowWatts,
         totalTodayWh,
         hourlyMap,
         hasData: hourlyMap.size > 0 || (isTargetToday && livePowerWatts !== null),
@@ -5190,12 +5202,18 @@
 
       let liveSum = 0;
       let hasLive = false;
+      let nowSum = 0;
+      let hasNow = false;
       let totalTodayWh = 0;
       for (const st of list) {
         totalTodayWh += st.totalTodayWh || 0;
         if (st.livePowerWatts !== null && st.livePowerWatts !== undefined) {
           liveSum += st.livePowerWatts;
           hasLive = true;
+        }
+        if (st.nowWatts !== null && st.nowWatts !== undefined) {
+          nowSum += st.nowWatts;
+          hasNow = true;
         }
       }
 
@@ -5204,6 +5222,7 @@
         friendlyName: `Summe (${list.length} Strings)`,
         unitType: 'mixed',
         livePowerWatts: hasLive ? Math.round(liveSum) : null,
+        nowWatts: hasNow ? Math.round(nowSum) : null,
         totalTodayWh,
         hourlyMap,
         hasData: hourlyMap.size > 0 || hasLive,
@@ -5476,9 +5495,21 @@
       const plotH = svgH - padT - padB;
       const baseY = padT + plotH;
 
+      const nowMs = Date.now();
+      const nowActualWatts =
+        dayOffset === 0 &&
+        actualStats &&
+        actualStats.nowWatts !== null &&
+        actualStats.nowWatts !== undefined
+          ? actualStats.nowWatts
+          : null;
+
       let rawMax = hasPvSystem ? Math.max(400, pvTotalWp * 0.22) : 200;
       for (const s of visibleSlots) {
         rawMax = Math.max(rawMax, s.forecastVal, s.idealVal || 0, s.actualVal || 0);
+      }
+      if (nowActualWatts !== null) {
+        rawMax = Math.max(rawMax, nowActualWatts);
       }
       const yMax = this._niceMaxWatts(rawMax * 1.12);
 
@@ -5501,13 +5532,7 @@
       const forecastPts = chartSlots.map((s) => ({ x: s.x, y: s.yForecast }));
       const forecastPath = this._buildMonotonePath(forecastPts, baseY);
 
-      const actualPts = chartSlots
-        .filter((s) => s.yActual !== null)
-        .map((s) => ({ x: s.x, y: s.yActual }));
-      const actualPath = actualPts.length > 0 ? this._buildMonotonePath(actualPts, baseY) : null;
-
       // Aktuelle Zeitposition ("Jetzt"-Linie nur bei Heute)
-      const nowMs = Date.now();
       let nowX = null;
       if (dayOffset === 0) {
         const firstMs = this._isoHourToUtcMs(chartSlots[0].iso, utcOffset);
@@ -5530,6 +5555,21 @@
           }
         }
       }
+
+      const actualPts = chartSlots
+        .filter((s) => s.yActual !== null && (nowX === null || s.x <= nowX + 0.5))
+        .map((s) => ({ x: s.x, y: s.yActual }));
+      if (dayOffset === 0 && nowX !== null && nowActualWatts !== null) {
+        const yNow = mapY(nowActualWatts);
+        const lastPt = actualPts.length > 0 ? actualPts[actualPts.length - 1] : null;
+        if (!lastPt || nowX > lastPt.x + 1.0) {
+          actualPts.push({ x: nowX, y: yNow });
+        } else if (Math.abs(nowX - lastPt.x) <= 1.0) {
+          lastPt.x = nowX;
+          lastPt.y = yNow;
+        }
+      }
+      const actualPath = actualPts.length > 0 ? this._buildMonotonePath(actualPts, baseY) : null;
 
       // Y-Achsen-Rasterlinien
       const formatYTick = (val) => {
