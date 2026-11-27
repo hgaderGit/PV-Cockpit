@@ -5,6 +5,7 @@
  *
  * Features:
  * - PV-Ertragsprognose & Idealkurve ("Ideal (klar)") mit Temperatur- & Wind-Einfluss (Open-Meteo, GeoSphere Austria / ZAMG 1km, Met.no)
+ * - Batteriespeicher-Analyse mit Tagesbilanz (00:00–24:00), 6-Tage Lade-Prognose (kWh) & 30-Tage Tagesbilanz-Verlauf
  * - Automatische Sonnentag-Kalibrierung für Baum- & Horizontverschattung + Ist-Ertragsabgleich (zeitgewichtete Wh-Integration)
  * - Optionaler Karten-/Radar-Hintergrund (Esri Basemap, RainViewer Regenradar, DWD Meteosat-Wolken, ZAMG Wetterwarnungen, GeoNames)
  * - Integrierter visueller Karten-Editor (getConfigElement) für Home Assistant Lovelace
@@ -367,6 +368,847 @@
       }
     }
     return minFactor;
+  }
+
+  const BATTERY_LOAD_PROFILE_WEIGHTS = {
+    standard: [
+      0.48, 0.44, 0.42, 0.42, 0.45, 0.62, 0.95, 1.25, 1.12, 0.92, 0.88, 1.15,
+      1.22, 0.98, 0.90, 0.95, 1.12, 1.48, 1.72, 1.68, 1.42, 1.15, 0.82, 0.58,
+    ],
+    homeoffice: [
+      0.45, 0.42, 0.40, 0.40, 0.44, 0.58, 0.85, 1.15, 1.28, 1.32, 1.30, 1.40,
+      1.38, 1.25, 1.22, 1.18, 1.15, 1.32, 1.45, 1.38, 1.18, 0.95, 0.72, 0.52,
+    ],
+    waermepumpe: [
+      0.92, 0.95, 0.98, 1.02, 1.10, 1.28, 1.38, 1.32, 1.12, 0.96, 0.88, 0.94,
+      0.96, 0.86, 0.82, 0.90, 1.08, 1.32, 1.42, 1.36, 1.22, 1.08, 0.98, 0.94,
+    ],
+    e_auto_abend: [
+      0.45, 0.42, 0.40, 0.40, 0.44, 0.58, 0.88, 1.10, 0.92, 0.82, 0.80, 0.98,
+      1.02, 0.88, 0.82, 0.88, 1.12, 1.85, 2.35, 2.40, 2.10, 1.55, 0.85, 0.55,
+    ],
+  };
+
+  function normalizeBatterySystemConfig(raw) {
+    const hasObj = Boolean(raw && typeof raw === 'object');
+    const src = hasObj ? raw : {};
+    const cap = Number(src.capacity_kwh ?? src.capacityKwh ?? 0);
+    const capacityKwh = Number.isFinite(cap) && cap > 0 ? Math.min(200, Math.max(0.5, cap)) : 0;
+    const enabled =
+      src.enabled !== undefined ? Boolean(src.enabled) && capacityKwh > 0 : capacityKwh > 0;
+    const minSoc = Number.isFinite(Number(src.min_soc_pct))
+      ? Math.min(85, Math.max(0, Number(src.min_soc_pct)))
+      : 10;
+    const maxSoc = Number.isFinite(Number(src.max_soc_pct))
+      ? Math.min(100, Math.max(minSoc + 5, Number(src.max_soc_pct)))
+      : 100;
+    const maxChargeKw = Number.isFinite(Number(src.max_charge_kw))
+      ? Math.min(100, Math.max(0.2, Number(src.max_charge_kw)))
+      : 5.0;
+    const maxDischargeKw = Number.isFinite(Number(src.max_discharge_kw))
+      ? Math.min(100, Math.max(0.2, Number(src.max_discharge_kw)))
+      : 5.0;
+    const effPct = Number.isFinite(Number(src.efficiency_pct))
+      ? Math.min(99, Math.max(65, Number(src.efficiency_pct)))
+      : 92;
+    const initSoc = Number.isFinite(Number(src.initial_soc_pct))
+      ? Math.min(maxSoc, Math.max(minSoc, Number(src.initial_soc_pct)))
+      : 30;
+    const baseLoadW = Number.isFinite(Number(src.base_load_w))
+      ? Math.min(15000, Math.max(40, Number(src.base_load_w)))
+      : 380;
+    const dailyLoadKwh = Number.isFinite(Number(src.daily_load_kwh))
+      ? Math.min(200, Math.max(1, Number(src.daily_load_kwh)))
+      : 12.0;
+    const rawProf = String(src.load_profile || 'standard').trim().toLowerCase();
+    const loadProfile = BATTERY_LOAD_PROFILE_WEIGHTS[rawProf] ? rawProf : 'standard';
+
+    return {
+      enabled,
+      capacity_kwh: capacityKwh,
+      min_soc_pct: minSoc,
+      max_soc_pct: maxSoc,
+      max_charge_kw: maxChargeKw,
+      max_discharge_kw: maxDischargeKw,
+      efficiency_pct: effPct,
+      initial_soc_pct: initSoc,
+      soc_entity: String(src.soc_entity || '').trim(),
+      power_entity: String(src.power_entity || '').trim(),
+      load_entity: String(src.load_entity || '').trim(),
+      base_load_w: baseLoadW,
+      daily_load_kwh: dailyLoadKwh,
+      load_profile: loadProfile,
+      use_7d_load_forecast:
+        src.use_7d_load_forecast !== undefined ? Boolean(src.use_7d_load_forecast) : true,
+      show_soc_in_chart: false,
+    };
+  }
+
+  function computeBatteryLoadProfileHourly(profile, dailyLoadKwh, baseLoadW) {
+    const weights = BATTERY_LOAD_PROFILE_WEIGHTS[profile] || BATTERY_LOAD_PROFILE_WEIGHTS.standard;
+    const floorW = Math.max(40, Number(baseLoadW) || 350);
+    const floorWh = 24 * floorW;
+    const targetWh = Math.max(floorWh, (Number(dailyLoadKwh) || 12) * 1000);
+    const varWh = Math.max(0, targetWh - floorWh);
+    const sumW = weights.reduce((a, b) => a + b, 0) || 24;
+    return weights.map((w) => Math.round(floorW + (w / sumW) * varWh));
+  }
+
+  function simulateBatteryDayTrajectory({
+    slots,
+    batteryCfg,
+    startSocPct,
+    currentIsoPrefix = null,
+    isToday = false,
+    liveSocPct = null,
+    actualSocMap = null,
+    actualLoadMap = null,
+    forecastLoadHourlyW = null,
+  }) {
+    if (!batteryCfg || !batteryCfg.enabled || batteryCfg.capacity_kwh <= 0) return null;
+    const capKwh = batteryCfg.capacity_kwh;
+    const minSoc = batteryCfg.min_soc_pct;
+    const maxSoc = batteryCfg.max_soc_pct;
+    const minKwh = capKwh * (minSoc / 100);
+    const maxKwh = capKwh * (maxSoc / 100);
+    const maxChgW = batteryCfg.max_charge_kw * 1000;
+    const maxDisW = batteryCfg.max_discharge_kw * 1000;
+    const rtEff = batteryCfg.efficiency_pct / 100;
+    const etaChg = Math.sqrt(rtEff);
+    const etaDis = Math.sqrt(rtEff);
+    const loadProfile =
+      Array.isArray(forecastLoadHourlyW) && forecastLoadHourlyW.length === 24
+        ? forecastLoadHourlyW.map((w) => Math.max(40, Math.round(Number(w) || batteryCfg.base_load_w)))
+        : computeBatteryLoadProfileHourly(
+            batteryCfg.load_profile,
+            batteryCfg.daily_load_kwh,
+            batteryCfg.base_load_w
+          );
+
+    const initPct = Math.min(
+      maxSoc,
+      Math.max(minSoc, Number.isFinite(startSocPct) ? startSocPct : batteryCfg.initial_soc_pct)
+    );
+    let energyKwh = capKwh * (initPct / 100);
+    let idealEnergyKwh = capKwh * (initPct / 100);
+    let batteryFullReached = initPct >= maxSoc - 0.5;
+    let fullTimeLabel = batteryFullReached ? '00:00' : null;
+    let emptyTimeLabel = null;
+    let maxSocPct = initPct;
+    let minSocPct = initPct;
+    let pvTotalWh = 0;
+    let loadTotalWh = 0;
+    let chargedKwh = 0;
+    let dischargedKwh = 0;
+    let gridImportKwh = 0;
+    let gridExportKwh = 0;
+    let surplusAfterFullKwh = 0;
+    let surplusStartHh = null;
+    let surplusEndHh = null;
+
+    const step = (curKwh, pvW, loadW) => {
+      const netW = pvW - loadW;
+      if (netW >= 0) {
+        const headroomKwh = Math.max(0, maxKwh - curKwh);
+        const maxByHeadroomW = (headroomKwh / etaChg) * 1000;
+        const chgW = Math.min(netW, maxChgW, maxByHeadroomW);
+        const nextKwh = Math.min(maxKwh, curKwh + (chgW / 1000) * etaChg);
+        return {
+          nextKwh,
+          battW: Math.round(chgW),
+          impW: 0,
+          expW: Math.max(0, Math.round(netW - chgW)),
+        };
+      }
+      const defW = -netW;
+      const availKwh = Math.max(0, curKwh - minKwh);
+      const maxByReserveW = availKwh * etaDis * 1000;
+      const disW = Math.min(defW, maxDisW, maxByReserveW);
+      const nextKwh = Math.max(minKwh, curKwh - disW / 1000 / etaDis);
+      return {
+        nextKwh,
+        battW: -Math.round(disW),
+        impW: Math.max(0, Math.round(defW - disW)),
+        expW: 0,
+      };
+    };
+
+    const perSlot = [];
+    let anchoredLive = false;
+    for (let i = 0; i < slots.length; i++) {
+      const s = slots[i];
+      if (s.isDayEndBoundary) {
+        perSlot.push({
+          socForecastPct: Math.round((energyKwh / capKwh) * 1000) / 10,
+          socIdealPct: Math.round((idealEnergyKwh / capKwh) * 1000) / 10,
+          socActualPct:
+            actualSocMap && actualSocMap.has(s.iso.slice(0, 13))
+              ? actualSocMap.get(s.iso.slice(0, 13))
+              : null,
+          loadW: 0,
+          battPowerW: 0,
+          gridImportW: 0,
+          gridExportW: 0,
+        });
+        continue;
+      }
+
+      const h = parseInt(String(s.hh || '0').slice(0, 2), 10) || 0;
+      const hk = String(s.iso || '').slice(0, 13);
+      const actSocVal = actualSocMap && actualSocMap.has(hk) ? actualSocMap.get(hk) : null;
+      const actLoadVal = actualLoadMap && actualLoadMap.has(hk) ? actualLoadMap.get(hk) : null;
+
+      if (isToday && !anchoredLive && currentIsoPrefix && hk >= currentIsoPrefix) {
+        anchoredLive = true;
+        if (Number.isFinite(liveSocPct)) {
+          energyKwh = capKwh * (Math.min(maxSoc, Math.max(minSoc, liveSocPct)) / 100);
+          batteryFullReached = liveSocPct >= maxSoc - 0.5;
+        } else if (Number.isFinite(actSocVal)) {
+          energyKwh = capKwh * (Math.min(maxSoc, Math.max(minSoc, actSocVal)) / 100);
+        }
+      }
+
+      const loadW = Number.isFinite(actLoadVal) ? actLoadVal : loadProfile[h] ?? batteryCfg.base_load_w;
+      const effPvW =
+        s.actualVal !== null && s.actualVal !== undefined && (!isToday || !currentIsoPrefix || hk < currentIsoPrefix)
+          ? s.actualVal
+          : s.forecastVal;
+
+      const prevKwh = energyKwh;
+      const sim = step(energyKwh, effPvW, loadW);
+      energyKwh = sim.nextKwh;
+
+      const idealSim = step(idealEnergyKwh, s.idealVal ?? s.forecastVal, loadW);
+      idealEnergyKwh = idealSim.nextKwh;
+
+      const socPct = Math.round((energyKwh / capKwh) * 1000) / 10;
+      const idealSocPct = Math.round((idealEnergyKwh / capKwh) * 1000) / 10;
+
+      minSocPct = Math.min(minSocPct, socPct);
+      maxSocPct = Math.max(maxSocPct, socPct);
+
+      if (!batteryFullReached && socPct >= maxSoc - 0.5) {
+        batteryFullReached = true;
+        const prevPct = (prevKwh / capKwh) * 100;
+        const frac = socPct > prevPct ? Math.min(1, Math.max(0, (maxSoc - prevPct) / (socPct - prevPct))) : 0.5;
+        fullTimeLabel = `${String(h).padStart(2, '0')}:${String(Math.round(frac * 55)).padStart(2, '0')}`;
+      }
+
+      if (emptyTimeLabel === null && h >= 17 && prevKwh > minKwh + 0.05 && energyKwh <= minKwh + 0.05) {
+        emptyTimeLabel = `${String(h).padStart(2, '0')}:45`;
+      }
+
+      if (sim.battW > 0) chargedKwh += (sim.battW / 1000) * etaChg;
+      if (sim.battW < 0) dischargedKwh += (-sim.battW / 1000) / etaDis;
+      gridImportKwh += sim.impW / 1000;
+      gridExportKwh += sim.expW / 1000;
+
+      if (batteryFullReached && sim.expW >= 250) {
+        surplusAfterFullKwh += sim.expW / 1000;
+        if (surplusStartHh === null) surplusStartHh = String(h).padStart(2, '0') + ':00';
+        surplusEndHh = String(h + 1).padStart(2, '0') + ':00';
+      }
+
+      pvTotalWh += effPvW;
+      loadTotalWh += loadW;
+
+      perSlot.push({
+        socForecastPct: socPct,
+        socIdealPct: idealSocPct,
+        socActualPct: actSocVal,
+        loadW: Math.round(loadW),
+        battPowerW: sim.battW,
+        gridImportW: sim.impW,
+        gridExportW: sim.expW,
+      });
+    }
+
+    const loadKwh = loadTotalWh / 1000;
+    const pvKwh = pvTotalWh / 1000;
+    const autarkyPct =
+      loadKwh > 0.1
+        ? Math.min(100, Math.max(0, Math.round(((loadKwh - gridImportKwh) / loadKwh) * 100)))
+        : 100;
+    const selfConsumptionPct =
+      pvKwh > 0.1
+        ? Math.min(100, Math.max(0, Math.round(((pvKwh - gridExportKwh) / pvKwh) * 100)))
+        : 0;
+    const endSocPct = Math.round((energyKwh / capKwh) * 100);
+    const surplusWindowLabel =
+      surplusStartHh && surplusEndHh ? `${surplusStartHh}–${surplusEndHh}` : null;
+
+    return {
+      perSlot,
+      summary: {
+        startSocPct: Math.round(initPct),
+        endSocPct,
+        minSocPct: Math.round(minSocPct),
+        maxSocPct: Math.round(maxSocPct),
+        fullTimeLabel,
+        emptyTimeLabel,
+        pvTotalKwh: Math.round(pvKwh * 10) / 10,
+        loadTotalKwh: Math.round(loadKwh * 10) / 10,
+        chargedKwh: Math.round(chargedKwh * 10) / 10,
+        dischargedKwh: Math.round(dischargedKwh * 10) / 10,
+        gridImportKwh: Math.round(gridImportKwh * 10) / 10,
+        gridExportKwh: Math.round(gridExportKwh * 10) / 10,
+        surplusAfterFullKwh: Math.round(surplusAfterFullKwh * 10) / 10,
+        surplusWindowLabel,
+        autarkyPct,
+        selfConsumptionPct,
+        nightCovered: endSocPct > minSoc + 8 && emptyTimeLabel === null,
+      },
+    };
+  }
+
+  function buildDualBatteryGraphicHtml({
+    resolvedSlots,
+    batterySim,
+    batteryCfg,
+    liveSocPct,
+    livePowerW,
+    dayOffset,
+    targetDateStr = '',
+    utcOffsetSec = 0,
+    pastSocRawPoints = null,
+    escapeHtml,
+  }) {
+    const perSlot = batterySim?.perSlot || [];
+    const sum = batterySim?.summary;
+    if (!sum || !perSlot.length) return '';
+
+    const capKwh = Number(batteryCfg.capacity_kwh) || 10;
+    const validSlots = perSlot.filter((_, idx) => !resolvedSlots[idx]?.isDayEndBoundary);
+    const series = validSlots.length ? validSlots : perSlot;
+
+    // Locate morning/day min and peak max indices so the rising curve goes naturally min -> max
+    let maxIdx = 0;
+    let maxVal = -Infinity;
+    for (let i = 0; i < series.length; i++) {
+      const v = Number(series[i].socForecastPct ?? 0);
+      if (v > maxVal) {
+        maxVal = v;
+        maxIdx = i;
+      }
+    }
+    let minIdx = 0;
+    let minVal = Infinity;
+    for (let i = 0; i <= maxIdx; i++) {
+      const v = Number(series[i].socForecastPct ?? 0);
+      if (v < minVal) {
+        minVal = v;
+        minIdx = i;
+      }
+    }
+    if (!Number.isFinite(minVal)) minVal = sum.minSocPct;
+    if (!Number.isFinite(maxVal)) maxVal = sum.maxSocPct;
+
+    let progSegment = series.slice(minIdx, maxIdx + 1).map((p) => Number(p.socForecastPct ?? 0));
+    if (progSegment.length < 2) {
+      progSegment = [sum.minSocPct, sum.maxSocPct];
+    }
+
+    const progMin = Math.round(Math.min(minVal, sum.minSocPct));
+    const progMax = Math.round(Math.max(maxVal, sum.maxSocPct));
+    const progPeakSlot = resolvedSlots[maxIdx];
+    const progTimeStr = sum.fullTimeLabel
+      ? `voll ${sum.fullTimeLabel}`
+      : progPeakSlot?.hh
+      ? `Peak ${progPeakSlot.hh}`
+      : '';
+    const progKwh = ((progMax / 100) * capKwh).toFixed(1);
+
+    // SVG geometry (generous room left/right & bottom for time axis so labels never clip)
+    const vbW = 320;
+    const vbH = 236;
+    const bx = 84;
+    const by = 26;
+    const bw = 152;
+    const bh = 180;
+    const capW = 54;
+    const capH = 12;
+    const capX = bx + (bw - capW) / 2;
+    const capY = by - capH;
+
+    const yForPct = (pct) => {
+      const clamped = Math.min(100, Math.max(0, Number(pct) || 0));
+      return by + bh - 6 - (clamped / 100) * (bh - 14);
+    };
+
+    const buildSmoothPath = (normPts) => {
+      if (!normPts.length) return '';
+      const coords = normPts.map((pt) => ({
+        x: bx + 3 + pt.t * (bw - 6),
+        y: yForPct(pt.pct),
+      }));
+      if (coords.length === 1) {
+        return `M ${coords[0].x.toFixed(1)} ${coords[0].y.toFixed(1)}`;
+      }
+      let d = `M ${coords[0].x.toFixed(1)} ${coords[0].y.toFixed(1)}`;
+      for (let i = 1; i < coords.length; i++) {
+        const prev = coords[i - 1];
+        const cur = coords[i];
+        const cx = ((prev.x + cur.x) / 2).toFixed(1);
+        d += ` C ${cx} ${prev.y.toFixed(1)}, ${cx} ${cur.y.toFixed(1)}, ${cur.x.toFixed(1)} ${cur.y.toFixed(1)}`;
+      }
+      return d;
+    };
+
+    const progNorm = progSegment.map((pct, i) => ({
+      t: progSegment.length > 1 ? i / (progSegment.length - 1) : 1,
+      pct,
+    }));
+    const progLineD = buildSmoothPath(progNorm);
+    const progLastX = (bx + bw - 3).toFixed(1);
+    const progFirstX = (bx + 3).toFixed(1);
+    const progBottomY = (by + bh - 2).toFixed(1);
+    const progAreaD = `${progLineD} L ${progLastX} ${progBottomY} L ${progFirstX} ${progBottomY} Z`;
+
+    const yProgMin = yForPct(progMin);
+    const yProgMax = yForPct(progMax);
+
+    const showPrognose = false;
+    const showIst = dayOffset <= 0;
+    if (!showPrognose && !showIst) return '';
+    const isSingle = !(showPrognose && showIst);
+
+    // Unified 00:00..24:00 trajectory + exact min/max with timestamps for Heute (dayOffset === 0) and past days (dayOffset < 0)
+    const fmtClockFromMs = (tMs, dayEndMs) => {
+      if (Number.isFinite(dayEndMs) && Math.abs(tMs - dayEndMs) <= 60000) return '24:00';
+      const d = new Date(tMs + (Number(utcOffsetSec) || 0) * 1000);
+      return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+    };
+
+    const parsedDayUtc = targetDateStr ? Date.parse(`${targetDateStr}T00:00:00Z`) : NaN;
+    const dayStartMs = Number.isFinite(parsedDayUtc)
+      ? parsedDayUtc - (Number(utcOffsetSec) || 0) * 1000
+      : NaN;
+    const dayEndMs = Number.isFinite(dayStartMs) ? dayStartMs + 86400000 : NaN;
+    const nowClockMs = Date.now();
+    const curveEndMs =
+      dayOffset === 0 && Number.isFinite(dayStartMs)
+        ? Math.min(dayEndMs, Math.max(dayStartMs + 60000, nowClockMs))
+        : dayEndMs;
+    const curveEndT =
+      Number.isFinite(dayStartMs) && Number.isFinite(curveEndMs)
+        ? Math.min(1, Math.max(0.01, (curveEndMs - dayStartMs) / 86400000))
+        : 1;
+    const nowTimeLabel =
+      Number.isFinite(curveEndMs) && Number.isFinite(dayEndMs)
+        ? fmtClockFromMs(curveEndMs, dayEndMs)
+        : 'Jetzt';
+
+    let dayFullPts = [];
+    let dayMinInfo = null;
+    let dayMaxInfo = null;
+    let dayStartPct = null;
+    let dayEndPct = null;
+
+    if (dayOffset <= 0) {
+      const rawFiltered = Array.isArray(pastSocRawPoints) && Number.isFinite(dayStartMs)
+        ? pastSocRawPoints
+            .filter(
+              (p) =>
+                Number.isFinite(p?.t) &&
+                Number.isFinite(p?.v) &&
+                p.t >= dayStartMs - 1800000 &&
+                p.t <= curveEndMs + 1800000
+            )
+            .slice()
+            .sort((a, b) => a.t - b.t)
+        : [];
+
+      if (dayOffset === 0 && Number.isFinite(liveSocPct) && Number.isFinite(curveEndMs)) {
+        const lastRaw = rawFiltered[rawFiltered.length - 1];
+        if (!lastRaw || curveEndMs - lastRaw.t > 30000) {
+          rawFiltered.push({ t: curveEndMs, v: liveSocPct });
+        } else {
+          rawFiltered[rawFiltered.length - 1] = { t: curveEndMs, v: liveSocPct };
+        }
+      }
+
+      if (rawFiltered.length >= 2 && Number.isFinite(dayStartMs)) {
+        const inDayRaw = rawFiltered.filter(
+          (p) => p.t >= dayStartMs - 60000 && p.t <= curveEndMs + 60000
+        );
+        const evalPts = inDayRaw.length >= 2 ? inDayRaw : rawFiltered;
+
+        const interpAtMs = (targetMs) => {
+          if (targetMs <= rawFiltered[0].t) return Math.min(100, Math.max(0, rawFiltered[0].v));
+          const last = rawFiltered[rawFiltered.length - 1];
+          if (targetMs >= last.t) return Math.min(100, Math.max(0, last.v));
+          for (let j = 1; j < rawFiltered.length; j++) {
+            const p0 = rawFiltered[j - 1];
+            const p1 = rawFiltered[j];
+            if (targetMs <= p1.t) {
+              const spanMs = p1.t - p0.t;
+              const frac = spanMs > 0 ? (targetMs - p0.t) / spanMs : 0;
+              return Math.min(100, Math.max(0, p0.v + (p1.v - p0.v) * frac));
+            }
+          }
+          return Math.min(100, Math.max(0, last.v));
+        };
+
+        // Sample every 30 min from 00:00 up to curveEndMs (24:00 for past days, Jetzt for Heute)
+        for (let k = 0; k <= 48; k++) {
+          const tMs = dayStartMs + k * 1800000;
+          if (tMs > curveEndMs - 120000) break;
+          dayFullPts.push({
+            t: k / 48,
+            pct: interpAtMs(tMs),
+            timeLabel: fmtClockFromMs(tMs, dayEndMs),
+          });
+        }
+        dayFullPts.push({
+          t: curveEndT,
+          pct: interpAtMs(curveEndMs),
+          timeLabel: fmtClockFromMs(curveEndMs, dayEndMs),
+        });
+
+        // Exact min & max from raw points inside [00:00, curveEndMs]
+        let minQ = Infinity;
+        let maxQ = -Infinity;
+        for (const p of evalPts) {
+          const clampedMs = Math.min(curveEndMs, Math.max(dayStartMs, p.t));
+          const pct = Math.min(100, Math.max(0, p.v));
+          const q = Math.round(pct * 10);
+          const tNorm = (clampedMs - dayStartMs) / 86400000;
+          const lbl = fmtClockFromMs(clampedMs, dayEndMs);
+          if (q < minQ) {
+            minQ = q;
+            dayMinInfo = { pct, t: tNorm, timeLabel: lbl };
+          }
+          if (q > maxQ) {
+            maxQ = q;
+            dayMaxInfo = { pct, t: tNorm, timeLabel: lbl };
+          }
+        }
+      } else {
+        // Fallback to hourly slots from 00:00 up to curveEndT (using actualSoc on past days, actual/sim on Heute)
+        const maxHour = dayOffset === 0 ? curveEndT * 24 : 24;
+        const knownHourly = [];
+        for (let i = 0; i < perSlot.length; i++) {
+          const s = resolvedSlots[i];
+          const p = perSlot[i];
+          if (!s || !p) continue;
+          const hVal = s.isDayEndBoundary
+            ? 24
+            : Number.isFinite(parseInt(String(s.hh || '').slice(0, 2), 10))
+            ? parseInt(String(s.hh).slice(0, 2), 10)
+            : i;
+          if (hVal > maxHour + 0.05) continue;
+          const val = Number.isFinite(p.socActualPct)
+            ? Number(p.socActualPct)
+            : dayOffset === 0 && Number.isFinite(p.socForecastPct)
+            ? Number(p.socForecastPct)
+            : null;
+          if (val === null) continue;
+          knownHourly.push({
+            t: Math.min(curveEndT, Math.max(0, hVal / 24)),
+            pct: Math.min(100, Math.max(0, val)),
+            timeLabel: s.isDayEndBoundary ? '24:00' : String(s.hh || `${String(hVal).padStart(2, '0')}:00`).slice(0, 5),
+          });
+        }
+        if (knownHourly.length >= 1) {
+          dayFullPts = knownHourly.slice();
+          if (dayFullPts[0].t > 0.001) {
+            dayFullPts.unshift({ t: 0, pct: dayFullPts[0].pct, timeLabel: '00:00' });
+          }
+          if (dayOffset === 0 && Number.isFinite(liveSocPct)) {
+            const lastIdx = dayFullPts.length - 1;
+            if (Math.abs(dayFullPts[lastIdx].t - curveEndT) < 0.015) {
+              dayFullPts[lastIdx] = { t: curveEndT, pct: liveSocPct, timeLabel: nowTimeLabel };
+            } else {
+              dayFullPts.push({ t: curveEndT, pct: liveSocPct, timeLabel: nowTimeLabel });
+            }
+          } else if (dayFullPts[dayFullPts.length - 1].t < curveEndT - 0.002) {
+            dayFullPts.push({
+              t: curveEndT,
+              pct: dayFullPts[dayFullPts.length - 1].pct,
+              timeLabel: dayOffset < 0 ? '24:00' : nowTimeLabel,
+            });
+          }
+          let minQ = Infinity;
+          let maxQ = -Infinity;
+          for (const kp of dayFullPts) {
+            const q = Math.round(kp.pct * 10);
+            if (q < minQ) {
+              minQ = q;
+              dayMinInfo = kp;
+            }
+            if (q > maxQ) {
+              maxQ = q;
+              dayMaxInfo = kp;
+            }
+          }
+        }
+      }
+
+      if (dayFullPts.length >= 2) {
+        const injectPeakPoint = (pt) => {
+          if (!pt) return;
+          const nearIdx = dayFullPts.findIndex((c) => Math.abs(c.t - pt.t) < 0.011);
+          if (nearIdx >= 0) {
+            dayFullPts[nearIdx] = { ...dayFullPts[nearIdx], pct: pt.pct };
+          } else {
+            dayFullPts.push({ t: pt.t, pct: pt.pct, timeLabel: pt.timeLabel });
+            dayFullPts.sort((a, b) => a.t - b.t);
+          }
+        };
+        injectPeakPoint(dayMinInfo);
+        injectPeakPoint(dayMaxInfo);
+        dayStartPct = Math.round(dayFullPts[0].pct);
+        dayEndPct = Math.round(dayFullPts[dayFullPts.length - 1].pct);
+      }
+    }
+
+    let istDisplayPct = null;
+    if (dayOffset === 0 && Number.isFinite(liveSocPct)) {
+      istDisplayPct = Math.round(liveSocPct);
+    } else if (dayEndPct !== null) {
+      istDisplayPct = dayEndPct;
+    }
+
+    const istPointsRaw = dayFullPts.map((pt) => ({ t: pt.t, pct: pt.pct }));
+
+    // Ist curve paths (never extrapolated past curveEndT)
+    let istLineD = '';
+    let istAreaD = '';
+    let yIstVal = yForPct(istDisplayPct ?? progMin);
+    if (istPointsRaw.length >= 2) {
+      istLineD = buildSmoothPath(istPointsRaw);
+      const lastPt = istPointsRaw[istPointsRaw.length - 1];
+      const lastX = (bx + 3 + lastPt.t * (bw - 6)).toFixed(1);
+      istAreaD = `${istLineD} L ${lastX} ${progBottomY} L ${progFirstX} ${progBottomY} Z`;
+      yIstVal = yForPct(lastPt.pct);
+    }
+
+    const istKwh =
+      istDisplayPct !== null ? ((istDisplayPct / 100) * capKwh).toFixed(1) : '—';
+    const livePowerTxt =
+      dayOffset === 0 && Number.isFinite(livePowerW)
+        ? Math.abs(livePowerW) >= 40
+          ? `${livePowerW > 0 ? '+' : ''}${(livePowerW / 1000).toFixed(1)} kW ${
+              livePowerW > 0 ? 'lädt' : 'entlädt'
+            }`
+          : 'Standby'
+        : null;
+    const powerLabel =
+      dayOffset > 0
+        ? 'Zukunft (noch keine Ist-Daten)'
+        : dayOffset === 0
+        ? dayStartPct !== null && istDisplayPct !== null
+          ? `00:00 ${dayStartPct}%${livePowerTxt ? ' · ' + livePowerTxt : ''}`
+          : livePowerTxt || 'Keine SoC-Daten'
+        : dayStartPct !== null && dayEndPct !== null
+        ? `00:00 ${dayStartPct}% → 24:00 ${dayEndPct}%`
+        : 'Keine SoC-Daten';
+
+    const dayMinPct = dayMinInfo ? Math.round(dayMinInfo.pct) : null;
+    const dayMaxPct = dayMaxInfo ? Math.round(dayMaxInfo.pct) : null;
+    const dayMinTime = dayMinInfo?.timeLabel || '—';
+    const dayMaxTime = dayMaxInfo?.timeLabel || '—';
+    const dayMinKwh = dayMinPct !== null ? ((dayMinPct / 100) * capKwh).toFixed(1) : '—';
+    const dayMaxKwh = dayMaxPct !== null ? ((dayMaxPct / 100) * capKwh).toFixed(1) : '—';
+
+    const yDayMinRaw = dayMinInfo ? yForPct(dayMinInfo.pct) : yForPct(progMin);
+    const yDayMaxRaw = dayMaxInfo ? yForPct(dayMaxInfo.pct) : yForPct(progMax);
+    const yDayMinLbl = Math.min(by + bh - 24, Math.max(by + 16, yDayMinRaw));
+    const yDayMaxLbl = Math.min(by + bh - 24, Math.max(by + 16, yDayMaxRaw));
+    const xDayMinDot = dayMinInfo ? bx + 3 + dayMinInfo.t * (bw - 6) : bx;
+    const xDayMaxDot = dayMaxInfo ? bx + 3 + dayMaxInfo.t * (bw - 6) : bx + bw;
+    const xNowDot = bx + 3 + curveEndT * (bw - 6);
+
+    const dayGridAndAxisHtml = `
+        <!-- Time ticks under battery (00:00 – 24:00) -->
+        <line x1="${bx + 3}" y1="${by + bh}" x2="${bx + 3}" y2="${by + bh + 5}" stroke="#64748b" stroke-width="1.5" />
+        <text x="${bx + 3}" y="${by + bh + 18}" text-anchor="start" fill="#94a3b8" font-size="11" font-weight="600">00:00</text>
+        <line x1="${bx + bw / 2}" y1="${by + bh}" x2="${bx + bw / 2}" y2="${by + bh + 5}" stroke="#64748b" stroke-width="1.5" />
+        <text x="${bx + bw / 2}" y="${by + bh + 18}" text-anchor="middle" fill="#94a3b8" font-size="11" font-weight="600">12:00</text>
+        <line x1="${bx + bw - 3}" y1="${by + bh}" x2="${bx + bw - 3}" y2="${by + bh + 5}" stroke="#64748b" stroke-width="1.5" />
+        <text x="${bx + bw - 3}" y="${by + bh + 18}" text-anchor="end" fill="#94a3b8" font-size="11" font-weight="600">24:00</text>
+      `;
+
+    const dayMarkersSvgHtml =
+      dayMinPct !== null && dayMaxPct !== null
+        ? `
+        <!-- Left 'min' marker with timestamp -->
+        <line x1="${bx - 10}" y1="${yDayMinRaw.toFixed(1)}" x2="${bx + 8}" y2="${yDayMinRaw.toFixed(1)}" stroke="#94a3b8" stroke-width="2" />
+        <text x="${bx - 14}" y="${(yDayMinLbl - 7).toFixed(1)}" text-anchor="end" fill="#94a3b8" font-size="12" font-weight="700">min</text>
+        <text x="${bx - 14}" y="${(yDayMinLbl + 8).toFixed(1)}" text-anchor="end" fill="#f8fafc" font-size="15" font-weight="800">${dayMinPct}%</text>
+        <text x="${bx - 14}" y="${(yDayMinLbl + 22).toFixed(1)}" text-anchor="end" fill="#cbd5e1" font-size="11.5" font-weight="600">${escapeHtml(dayMinTime)} Uhr</text>
+
+        <!-- Right 'max' marker with timestamp -->
+        <line x1="${bx + bw - 8}" y1="${yDayMaxRaw.toFixed(1)}" x2="${bx + bw + 10}" y2="${yDayMaxRaw.toFixed(1)}" stroke="#6ee7b7" stroke-width="2.4" />
+        <text x="${bx + bw + 14}" y="${(yDayMaxLbl - 7).toFixed(1)}" text-anchor="start" fill="#6ee7b7" font-size="12" font-weight="700">max</text>
+        <text x="${bx + bw + 14}" y="${(yDayMaxLbl + 8).toFixed(1)}" text-anchor="start" fill="#f8fafc" font-size="15" font-weight="800">${dayMaxPct}%</text>
+        <text x="${bx + bw + 14}" y="${(yDayMaxLbl + 22).toFixed(1)}" text-anchor="start" fill="#cbd5e1" font-size="11.5" font-weight="600">${escapeHtml(dayMaxTime)} Uhr</text>
+      `
+        : '';
+
+    const istSvg = `
+      <svg class="pv-batt-svg" viewBox="0 0 ${vbW} ${vbH}" role="img" aria-label="Batterie Ist">
+        <defs>
+          <linearGradient id="pv-batt-grad-ist" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#34d399" stop-opacity="0.65" />
+            <stop offset="100%" stop-color="#047857" stop-opacity="0.18" />
+          </linearGradient>
+          <pattern id="pv-batt-hatch-ist" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(38)">
+            <line x1="0" y1="0" x2="0" y2="8" stroke="#6ee7b7" stroke-opacity="0.24" stroke-width="2" />
+          </pattern>
+          <clipPath id="pv-batt-clip-ist">
+            <rect x="${bx + 2}" y="${by + 2}" width="${bw - 4}" height="${bh - 4}" rx="10" />
+          </clipPath>
+        </defs>
+
+        <!-- Terminal Cap & Battery Body -->
+        <rect x="${capX}" y="${capY}" width="${capW}" height="${capH + 2}" rx="4" fill="#1e293b" stroke="#cbd5e1" stroke-width="2.5" />
+        <rect x="${bx}" y="${by}" width="${bw}" height="${bh}" rx="12" fill="#090f1d" stroke="#cbd5e1" stroke-width="2.5" />
+
+        <g clip-path="url(#pv-batt-clip-ist)">
+          <line x1="${bx + bw * 0.25}" y1="${by + 4}" x2="${bx + bw * 0.25}" y2="${by + bh - 4}" stroke="rgba(148,163,184,0.13)" stroke-dasharray="3 3" />
+          <line x1="${bx + bw * 0.5}" y1="${by + 4}" x2="${bx + bw * 0.5}" y2="${by + bh - 4}" stroke="rgba(148,163,184,0.18)" stroke-dasharray="3 3" />
+          <line x1="${bx + bw * 0.75}" y1="${by + 4}" x2="${bx + bw * 0.75}" y2="${by + bh - 4}" stroke="rgba(148,163,184,0.13)" stroke-dasharray="3 3" />
+          ${
+            istAreaD
+              ? `<path d="${istAreaD}" fill="url(#pv-batt-grad-ist)" />
+                 <path d="${istAreaD}" fill="url(#pv-batt-hatch-ist)" />
+                 <path d="${istLineD}" fill="none" stroke="#6ee7b7" stroke-width="3.4" stroke-linecap="round" />`
+              : ''
+          }
+          ${
+            dayOffset === 0 && istPointsRaw.length >= 2
+              ? `
+                <line x1="${xNowDot.toFixed(1)}" y1="${by + 4}" x2="${xNowDot.toFixed(1)}" y2="${by + bh - 4}" stroke="rgba(248,250,252,0.34)" stroke-dasharray="3 3" />
+              `
+              : ''
+          }
+          ${
+            dayMinInfo && dayMaxInfo
+              ? `
+                <circle cx="${xDayMinDot.toFixed(1)}" cy="${yDayMinRaw.toFixed(1)}" r="4.4" fill="#f8fafc" stroke="#090f1d" stroke-width="1.8" />
+                <circle cx="${xDayMaxDot.toFixed(1)}" cy="${yDayMaxRaw.toFixed(1)}" r="4.6" fill="#6ee7b7" stroke="#090f1d" stroke-width="1.8" />
+              `
+              : ''
+          }
+          ${
+            dayOffset === 0 && istPointsRaw.length >= 2
+              ? `<circle cx="${xNowDot.toFixed(1)}" cy="${yIstVal.toFixed(1)}" r="5" fill="#34d399" stroke="#f8fafc" stroke-width="2" />`
+              : ''
+          }
+        </g>
+
+        ${dayGridAndAxisHtml}
+        ${dayMarkersSvgHtml}
+      </svg>
+    `;
+
+    const progCardHtml = '';
+
+    const istOutsideHeaderHtml =
+      dayOffset === 0
+        ? `
+          <div class="pv-batt-minmax-split three">
+            <div class="pv-batt-minmax-col">
+              <span class="pv-batt-minmax-tag min">Min</span>
+              <span class="pv-batt-minmax-pct min">${dayMinPct !== null ? `${dayMinPct}%` : '—'}</span>
+              <span class="pv-batt-minmax-meta">${dayMinPct !== null ? `${escapeHtml(dayMinTime)} Uhr` : '—'}</span>
+            </div>
+            <div class="pv-batt-minmax-sep"></div>
+            <div class="pv-batt-minmax-col">
+              <span class="pv-batt-minmax-tag now">Aktuell</span>
+              <span class="pv-batt-minmax-pct now">${istDisplayPct !== null ? `${istDisplayPct}%` : '—'}</span>
+              <span class="pv-batt-minmax-meta">${istDisplayPct !== null ? `${istKwh} kWh · ${escapeHtml(nowTimeLabel)} Uhr` : 'Keine Daten'}</span>
+            </div>
+            <div class="pv-batt-minmax-sep"></div>
+            <div class="pv-batt-minmax-col">
+              <span class="pv-batt-minmax-tag max">Max</span>
+              <span class="pv-batt-minmax-pct max">${dayMaxPct !== null ? `${dayMaxPct}%` : '—'}</span>
+              <span class="pv-batt-minmax-meta">${dayMaxPct !== null ? `${escapeHtml(dayMaxTime)} Uhr` : '—'}</span>
+            </div>
+          </div>
+        `
+        : `
+          <div class="pv-batt-minmax-split">
+            <div class="pv-batt-minmax-col">
+              <span class="pv-batt-minmax-tag min">Min</span>
+              <span class="pv-batt-minmax-pct min">${dayMinPct !== null ? `${dayMinPct}%` : '—'}</span>
+              <span class="pv-batt-minmax-meta">${dayMinPct !== null ? `${escapeHtml(dayMinTime)} Uhr · ${dayMinKwh} kWh` : 'Keine Daten'}</span>
+            </div>
+            <div class="pv-batt-minmax-sep"></div>
+            <div class="pv-batt-minmax-col">
+              <span class="pv-batt-minmax-tag max">Max</span>
+              <span class="pv-batt-minmax-pct max">${dayMaxPct !== null ? `${dayMaxPct}%` : '—'}</span>
+              <span class="pv-batt-minmax-meta">${dayMaxPct !== null ? `${escapeHtml(dayMaxTime)} Uhr · ${dayMaxKwh} kWh` : 'Keine Daten'}</span>
+            </div>
+          </div>
+        `;
+
+    const dayStartExactPct = dayFullPts.length ? dayFullPts[0].pct : null;
+    const dayEndExactPct =
+      dayOffset === 0 && Number.isFinite(liveSocPct)
+        ? liveSocPct
+        : dayFullPts.length
+        ? dayFullPts[dayFullPts.length - 1].pct
+        : null;
+    const hasBalance = dayStartExactPct !== null && dayEndExactPct !== null;
+    const balanceRawPct = hasBalance ? dayEndExactPct - dayStartExactPct : null;
+    const balanceRoundedPct = balanceRawPct !== null ? Math.round(balanceRawPct) : null;
+    const balanceKwhNum = balanceRawPct !== null ? (balanceRawPct / 100) * capKwh : null;
+    const balancePctStr =
+      balanceRoundedPct === null
+        ? '—'
+        : `${balanceRoundedPct > 0 ? '+' : ''}${balanceRoundedPct}%`;
+    const balanceKwhStr =
+      balanceKwhNum === null
+        ? '—'
+        : Math.abs(balanceKwhNum) < 0.05
+        ? '0.0 kWh'
+        : `${balanceKwhNum > 0 ? '+' : ''}${balanceKwhNum.toFixed(1)} kWh`;
+    const balanceToneClass =
+      balanceRoundedPct === null
+        ? 'flat'
+        : balanceRoundedPct > 0
+        ? 'pos'
+        : balanceRoundedPct < 0
+        ? 'neg'
+        : 'flat';
+    const balanceRangeLabel = dayOffset < 0 ? '00:00 – 24:00' : '00:00 – Jetzt';
+    const startDispPct = dayStartExactPct !== null ? Math.round(dayStartExactPct) : null;
+    const endDispPct = dayEndExactPct !== null ? Math.round(dayEndExactPct) : null;
+    const balanceFromToStr =
+      startDispPct !== null && endDispPct !== null
+        ? `00:00 ${startDispPct}% → ${dayOffset < 0 ? '24:00' : escapeHtml(nowTimeLabel)} ${endDispPct}%`
+        : 'Keine SoC-Daten';
+
+    const istCardHtml = showIst
+      ? `
+        <div class="pv-batt-box">
+          <div class="pv-batt-main-split">
+            <div class="pv-batt-left-col">
+              ${istOutsideHeaderHtml}
+              ${istSvg}
+              <div class="pv-batt-big-title ist">${dayOffset < 0 ? 'Ist (00:00–24:00)' : 'Ist (00:00–Jetzt)'}</div>
+              <div class="pv-batt-big-sub">${escapeHtml(powerLabel)}</div>
+            </div>
+            <div class="pv-batt-balance-col">
+              <span class="pv-batt-balance-lbl">Tagesbilanz</span>
+              <span class="pv-batt-balance-range">${balanceRangeLabel}</span>
+              <span class="pv-batt-balance-pct ${balanceToneClass}">${balancePctStr}</span>
+              <span class="pv-batt-balance-kwh ${balanceToneClass}">${balanceKwhStr}</span>
+              <span class="pv-batt-balance-sub">${balanceFromToStr}</span>
+            </div>
+          </div>
+        </div>
+      `
+      : '';
+
+    return `
+      <div class="pv-batt-dual${isSingle ? ' single' : ''}">
+        ${progCardHtml}
+        ${istCardHtml}
+      </div>
+    `;
   }
 
   function computeSolarPosition(isoTime, utcOffsetSec, latDeg, lonDeg) {
@@ -1206,6 +2048,7 @@
         show_clouds: true,
         show_warnings: false,
         show_pv_panel: true,
+        show_battery_panel: true,
         show_map: true,
         hide_night: false,
         pv_mode: 'neutral',
@@ -1213,6 +2056,7 @@
         weather_entity: '',
         pv_shading: [],
         pv_shading_date: '',
+        battery_system: normalizeBatterySystemConfig(null),
         pv_system: {
           tilt: 25,
           ost: { count: 0, watt: 0 },
@@ -1246,16 +2090,22 @@
       this._isFullscreen = false;
       this._onFullscreenChange = null;
       this._onFullscreenKeyDown = null;
+      this._onFullscreenResize = null;
       this._warningCount = null;
       this._pvMode = 'neutral';
       this._pvDayOffset = 0;
+      this._showBatterySocInChart = true;
       this._pvActualHistory = null;
       this._pvEntityHistories = new Map();
       this._pvPastHistories = new Map();
       this._pvPastFetchingDates = new Set();
+      this._pvPastAttemptedDates = new Set();
       this._pvOpenMeteoPastDays = 14;
       this._pvEntityLastUpdated = new Map();
       this._pvActualFetching = false;
+      this._pvBatt30dHistory = null;
+      this._pvBatt30dFetching = false;
+      this._pv30dScrollFromRight = 0;
       this._pvLastEntityUpdated = null;
       this._pvLastLiveRenderAt = 0;
       this._weatherForecast = null;
@@ -1273,6 +2123,8 @@
       this._animationTimer = null;
       this._refreshTimer = null;
       this._resizeObserver = null;
+      this._pv30dResizeObserver = null;
+      this._pvPanelResizeObserver = null;
       this._initialized = false;
       this._hasCenteredOnHome = false;
       this._isDestroyed = false;
@@ -1288,7 +2140,6 @@
         height: '450px',
         auto_play: true,
         show_clouds: true,
-        show_pv_panel: true,
         hide_night: true,
         pv_mode: 'neutral',
       };
@@ -1314,8 +2165,9 @@
       const showClouds = config.show_clouds !== undefined ? Boolean(config.show_clouds) : true;
       const showWarnings =
         config.show_warnings !== undefined ? Boolean(config.show_warnings) : false;
-      const showPvPanel =
-        config.show_pv_panel !== undefined ? Boolean(config.show_pv_panel) : true;
+      const showPvPanel = true;
+      const showBatteryPanel =
+        config.show_battery_panel !== undefined ? Boolean(config.show_battery_panel) : true;
       const showMap = config.show_map !== undefined ? Boolean(config.show_map) : true;
       const hideNight =
         config.hide_night !== undefined ? Boolean(config.hide_night) : false;
@@ -1331,6 +2183,7 @@
       const cartoApiKey = config.carto_api_key ? String(config.carto_api_key).trim() : '';
 
       const pvSystem = this._normalizePvSystem(config.pv_system);
+      const batterySystem = normalizeBatterySystemConfig(config.battery_system);
       const pvMode = this._normalizePvMode(config.pv_mode);
       const pvActualEntity = String(
         config.pv_actual_entity ?? config.pv_system?.actual_entity ?? ''
@@ -1351,6 +2204,7 @@
         show_clouds: showClouds,
         show_warnings: showWarnings,
         show_pv_panel: showPvPanel,
+        show_battery_panel: showBatteryPanel,
         show_map: showMap,
         hide_night: hideNight,
         pv_mode: pvMode,
@@ -1358,6 +2212,7 @@
         weather_entity: weatherEntity,
         pv_shading: pvShading,
         pv_shading_date: pvShadingDate,
+        battery_system: batterySystem,
         pv_system: pvSystem,
       };
 
@@ -1366,10 +2221,20 @@
       this._radarEnabled = showRadar;
       this._cloudsEnabled = showClouds;
       this._warningsEnabled = showWarnings;
+      this._showBatterySocInChart = batterySystem.enabled && batterySystem.show_soc_in_chart;
       if (prevShowMap !== showMap || !this._initialized) {
         this._mapVisible = showMap;
       }
       this._pvMode = pvMode;
+
+      const prevSocEntity = String(this._config?.battery_system?.soc_entity || '').trim();
+      const nextSocEntity = String(batterySystem.soc_entity || '').trim();
+      if (prevSocEntity !== nextSocEntity) {
+        this._pvBatt30dHistory = null;
+        if (batterySystem.enabled && nextSocEntity && this._hass) {
+          this._fetchBatt30dHistory(true);
+        }
+      }
 
       const nextActualEntities = this._getConfiguredActualEntities();
       const nextActualKey = nextActualEntities.join(',');
@@ -1494,6 +2359,20 @@
         }
       }
 
+      const battSocEntity = this._config.battery_system?.enabled
+        ? String(this._config.battery_system?.soc_entity || '').trim()
+        : '';
+      if (battSocEntity && typeof hass?.callApi === 'function') {
+        const hist30 = this._pvBatt30dHistory;
+        const need30 =
+          !hist30 ||
+          hist30.entityId !== battSocEntity ||
+          Date.now() - (hist30.fetchedAt || 0) > 300000;
+        if (need30 && !this._pvBatt30dFetching) {
+          this._fetchBatt30dHistory(!hist30 || hist30.entityId !== battSocEntity);
+        }
+      }
+
       const weatherEntity = this._config.weather_entity;
       if (weatherEntity) {
         const wState = hass?.states?.[weatherEntity];
@@ -1553,6 +2432,14 @@
         this._resizeObserver.disconnect();
         this._resizeObserver = null;
       }
+      if (this._pv30dResizeObserver) {
+        this._pv30dResizeObserver.disconnect();
+        this._pv30dResizeObserver = null;
+      }
+      if (this._pvPanelResizeObserver) {
+        this._pvPanelResizeObserver.disconnect();
+        this._pvPanelResizeObserver = null;
+      }
       if (this._map) {
         this._map.remove();
         this._map = null;
@@ -1594,6 +2481,12 @@
       const strings = getPvSystemStrings(this._config?.pv_system);
       for (const s of strings) {
         add(s?.actual_entity);
+      }
+      const batt = this._config?.battery_system;
+      if (batt) {
+        add(batt.soc_entity);
+        add(batt.load_entity);
+        add(batt.power_entity);
       }
       return out;
     }
@@ -1644,7 +2537,13 @@
             display: none;
           }
 
-          .map-stage:fullscreen,
+          .map-stage:fullscreen {
+            width: 100vw !important;
+            height: 100vh !important;
+            height: 100dvh !important;
+            border-radius: 0 !important;
+          }
+
           .map-stage:-webkit-full-screen {
             width: 100vw !important;
             height: 100vh !important;
@@ -1914,20 +2813,40 @@
             border-bottom: none;
           }
 
-          .pv-panel:fullscreen,
-          .pv-panel:-webkit-full-screen {
+          .pv-panel-inner {
+            display: block;
+            width: 100%;
+          }
+
+          .pv-fs-pv-col,
+          .pv-batt-main-card {
+            display: contents;
+          }
+
+          .pv-panel.is-pv-fullscreen {
             width: 100vw !important;
             height: 100vh !important;
             height: 100dvh !important;
-            display: flex !important;
-            flex-direction: column !important;
-            gap: 12px;
-            padding: 18px 22px !important;
+            display: block !important;
+            padding: 12px 18px !important;
             box-sizing: border-box !important;
             border-bottom: none !important;
             border-radius: 0 !important;
             background: #0d1118 !important;
-            overflow-y: auto !important;
+            overflow: hidden !important;
+          }
+
+          .pv-panel:fullscreen {
+            width: 100vw !important;
+            height: 100vh !important;
+            height: 100dvh !important;
+            display: block !important;
+            padding: 12px 18px !important;
+            box-sizing: border-box !important;
+            border-bottom: none !important;
+            border-radius: 0 !important;
+            background: #0d1118 !important;
+            overflow: hidden !important;
           }
 
           .pv-panel.pseudo-fullscreen {
@@ -1937,30 +2856,45 @@
             height: 100vh !important;
             height: 100dvh !important;
             z-index: 2147483647 !important;
-            display: flex !important;
-            flex-direction: column !important;
-            gap: 12px;
-            padding: 18px 22px !important;
+            display: block !important;
+            padding: 12px 18px !important;
             box-sizing: border-box !important;
             border-bottom: none !important;
             border-radius: 0 !important;
             margin: 0 !important;
             background: #0d1118 !important;
-            overflow-y: auto !important;
+            overflow: hidden !important;
           }
 
-          .pv-panel:fullscreen .pv-chart-box,
-          .pv-panel:-webkit-full-screen .pv-chart-box,
-          .pv-panel.pseudo-fullscreen .pv-chart-box {
-            flex: 1 1 auto;
+          .pv-panel.is-pv-fullscreen .pv-panel-inner,
+          .pv-panel.pseudo-fullscreen .pv-panel-inner {
             display: flex;
             flex-direction: column;
-            min-height: 200px;
-            margin-top: 0;
+            gap: 10px;
+            width: 100%;
+            transform-origin: top left;
+            box-sizing: border-box;
           }
 
-          .pv-panel:fullscreen .pv-chart-stage,
-          .pv-panel:-webkit-full-screen .pv-chart-stage,
+          .pv-panel.is-pv-fullscreen .pv-fs-pv-col,
+          .pv-panel.pseudo-fullscreen .pv-fs-pv-col {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            min-width: 0;
+          }
+
+          .pv-panel.is-pv-fullscreen .pv-chart-box,
+          .pv-panel.pseudo-fullscreen .pv-chart-box {
+            flex: 0 0 auto;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+            margin-top: 0;
+            padding: 10px 14px 8px;
+          }
+
+          .pv-panel.is-pv-fullscreen .pv-chart-stage,
           .pv-panel.pseudo-fullscreen .pv-chart-stage {
             flex: 1 1 auto;
             display: flex;
@@ -1968,32 +2902,160 @@
             min-height: 0;
           }
 
-          .pv-panel:fullscreen .pv-chart-svg,
-          .pv-panel:-webkit-full-screen .pv-chart-svg,
+          .pv-panel.is-pv-fullscreen .pv-chart-svg,
           .pv-panel.pseudo-fullscreen .pv-chart-svg {
             width: 100%;
             height: auto;
-            max-height: 100%;
+            max-height: clamp(140px, 24vh, 230px);
           }
 
-          .pv-panel:fullscreen .pv-hourly-grid,
-          .pv-panel:-webkit-full-screen .pv-hourly-grid,
+          .pv-panel.is-pv-fullscreen:not(.has-batt) .pv-chart-svg,
+          .pv-panel.pseudo-fullscreen:not(.has-batt) .pv-chart-svg {
+            height: auto;
+            max-height: clamp(200px, 50vh, 420px);
+          }
+
+          .pv-panel.is-pv-fullscreen .pv-hourly-grid,
           .pv-panel.pseudo-fullscreen .pv-hourly-grid {
             margin-top: 0;
             flex-shrink: 0;
           }
 
-          .pv-panel:fullscreen .pv-hour-cell,
-          .pv-panel:-webkit-full-screen .pv-hour-cell,
+          .pv-panel.is-pv-fullscreen .pv-hour-cell,
           .pv-panel.pseudo-fullscreen .pv-hour-cell {
-            flex: 1 0 42px;
-            max-width: 76px;
+            flex: 1 0 38px;
+            max-width: none;
           }
 
-          .pv-panel:fullscreen .pv-map-toggle-btn,
-          .pv-panel:-webkit-full-screen .pv-map-toggle-btn,
+          .pv-panel.is-pv-fullscreen .pv-map-toggle-btn,
           .pv-panel.pseudo-fullscreen .pv-map-toggle-btn {
             display: none;
+          }
+
+          .pv-panel.is-wide-layout.has-batt .pv-panel-inner,
+          .pv-panel.is-pv-fullscreen.is-wide-layout.has-batt .pv-panel-inner,
+          .pv-panel.pseudo-fullscreen.is-wide-layout.has-batt .pv-panel-inner {
+            display: grid;
+            grid-template-columns: minmax(0, 1.38fr) minmax(360px, 1fr);
+            gap: 10px 12px;
+            align-items: stretch;
+          }
+
+          .pv-panel.is-wide-layout.has-batt .pv-summary-row,
+          .pv-panel.is-pv-fullscreen.is-wide-layout.has-batt .pv-summary-row,
+          .pv-panel.pseudo-fullscreen.is-wide-layout.has-batt .pv-summary-row {
+            grid-column: 1 / -1;
+          }
+
+          .pv-panel.is-wide-layout.has-batt .pv-fs-pv-col,
+          .pv-panel.is-pv-fullscreen.is-wide-layout.has-batt .pv-fs-pv-col,
+          .pv-panel.pseudo-fullscreen.is-wide-layout.has-batt .pv-fs-pv-col {
+            grid-column: 1;
+            grid-row: 2;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            min-width: 0;
+            justify-content: space-between;
+          }
+
+          .pv-panel.is-wide-layout.has-batt .pv-chart-box,
+          .pv-panel.is-pv-fullscreen.is-wide-layout.has-batt .pv-chart-box,
+          .pv-panel.pseudo-fullscreen.is-wide-layout.has-batt .pv-chart-box {
+            flex: 1 1 auto;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            min-height: 0;
+            margin-top: 0;
+            padding: 10px 14px 8px;
+          }
+
+          .pv-panel.is-wide-layout.has-batt .pv-chart-stage,
+          .pv-panel.is-pv-fullscreen.is-wide-layout.has-batt .pv-chart-stage,
+          .pv-panel.pseudo-fullscreen.is-wide-layout.has-batt .pv-chart-stage {
+            flex: 1 1 auto;
+            display: flex;
+            align-items: center;
+            min-height: 0;
+          }
+
+          .pv-panel.is-wide-layout.has-batt .pv-chart-svg,
+          .pv-panel.is-pv-fullscreen.is-wide-layout.has-batt .pv-chart-svg,
+          .pv-panel.pseudo-fullscreen.is-wide-layout.has-batt .pv-chart-svg {
+            width: 100%;
+            height: auto;
+            max-height: clamp(190px, 34vh, 340px);
+          }
+
+          .pv-panel.is-wide-layout:not(.has-batt) .pv-chart-svg {
+            width: 100%;
+            height: auto;
+            max-height: clamp(200px, 42vh, 360px);
+          }
+
+          .pv-panel.is-wide-layout.has-batt .pv-hourly-grid {
+            margin-top: 0;
+            flex-shrink: 0;
+          }
+
+          .pv-panel.is-wide-layout.has-batt .pv-hour-cell {
+            flex: 1 0 38px;
+            max-width: none;
+          }
+
+          .pv-panel.is-wide-layout.has-batt .pv-batt-strip.is-visible,
+          .pv-panel.is-pv-fullscreen.is-wide-layout.has-batt .pv-batt-strip.is-visible,
+          .pv-panel.pseudo-fullscreen.is-wide-layout.has-batt .pv-batt-strip.is-visible {
+            display: contents !important;
+          }
+
+          .pv-panel.is-wide-layout.has-batt .pv-batt-main-card,
+          .pv-panel.is-pv-fullscreen.is-wide-layout.has-batt .pv-batt-main-card,
+          .pv-panel.pseudo-fullscreen.is-wide-layout.has-batt .pv-batt-main-card {
+            grid-column: 2;
+            grid-row: 2;
+            padding: 12px 14px;
+            border-radius: 10px;
+            border: 1px solid rgba(192, 132, 252, 0.25);
+            background: rgba(15, 20, 32, 0.82);
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            gap: 10px;
+            min-width: 0;
+          }
+
+          .pv-panel.is-wide-layout.has-batt .pv-batt-dual.single,
+          .pv-panel.is-pv-fullscreen.is-wide-layout.has-batt .pv-batt-dual.single,
+          .pv-panel.pseudo-fullscreen.is-wide-layout.has-batt .pv-batt-dual.single {
+            grid-template-columns: minmax(0, 1fr);
+          }
+
+          .pv-panel.is-wide-layout.has-batt .pv-batt-box,
+          .pv-panel.is-pv-fullscreen.is-wide-layout.has-batt .pv-batt-box,
+          .pv-panel.pseudo-fullscreen.is-wide-layout.has-batt .pv-batt-box {
+            padding: 10px 14px;
+          }
+
+          .pv-panel.is-wide-layout.has-batt .pv-batt-30d-wrap,
+          .pv-panel.is-pv-fullscreen.is-wide-layout.has-batt .pv-batt-30d-wrap,
+          .pv-panel.pseudo-fullscreen.is-wide-layout.has-batt .pv-batt-30d-wrap {
+            grid-column: 1 / -1;
+            grid-row: 3;
+            padding: 10px 14px;
+            border-radius: 10px;
+            border: 1px solid rgba(192, 132, 252, 0.25);
+            background: rgba(15, 20, 32, 0.82);
+          }
+
+          .pv-panel.is-wide-layout.has-batt .pv-batt-30d-yaxis,
+          .pv-panel.is-pv-fullscreen.is-wide-layout.has-batt .pv-batt-30d-yaxis,
+          .pv-panel.pseudo-fullscreen.is-wide-layout.has-batt .pv-batt-30d-yaxis,
+          .pv-panel.is-wide-layout.has-batt .pv-batt-30d-plot,
+          .pv-panel.is-pv-fullscreen.is-wide-layout.has-batt .pv-batt-30d-plot,
+          .pv-panel.pseudo-fullscreen.is-wide-layout.has-batt .pv-batt-30d-plot {
+            height: 112px;
           }
 
           .pv-summary-row {
@@ -2179,8 +3241,8 @@
           }
 
           .pv-chart-title {
-            font-size: 11px;
-            font-weight: 600;
+            font-size: 14px;
+            font-weight: 700;
             color: #e2e8f0;
             letter-spacing: 0.01em;
           }
@@ -2188,27 +3250,29 @@
           .pv-range-switch {
             display: inline-flex;
             align-items: center;
-            border-radius: 6px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            background: rgba(255, 255, 255, 0.04);
-            padding: 2px;
-            gap: 2px;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            background: rgba(255, 255, 255, 0.05);
+            padding: 3px;
+            gap: 3px;
           }
 
           .pv-range-btn {
             border: none;
             background: transparent;
-            color: #94a3b8;
-            font-size: 10px;
+            color: #cbd5e1;
+            font-size: 12.5px;
             font-weight: 500;
-            padding: 2px 7px;
-            border-radius: 4px;
+            padding: 6px 12px;
+            min-height: 32px;
+            border-radius: 6px;
             cursor: pointer;
             font-family: inherit;
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            line-height: 1.3;
+            line-height: 1.25;
+            touch-action: manipulation;
           }
 
           .pv-range-btn[hidden] {
@@ -2221,23 +3285,24 @@
           }
 
           .pv-range-btn.pv-day-nav {
-            padding: 2px 5px;
+            padding: 6px 11px;
+            min-width: 34px;
           }
 
           .pv-range-btn.pv-day-nav svg {
-            width: 11px;
-            height: 11px;
+            width: 15px;
+            height: 15px;
             display: block;
           }
 
           .pv-range-btn.active {
-            background: rgba(56, 189, 248, 0.2);
+            background: rgba(56, 189, 248, 0.22);
             color: #e0f2fe;
             font-weight: 600;
           }
 
           .pv-range-btn.pv-day-current {
-            min-width: 58px;
+            min-width: 72px;
           }
 
           .pv-range-btn.pv-day-current.is-past {
@@ -2245,24 +3310,46 @@
             color: #fde68a;
           }
 
+          @media (max-width: 640px) {
+            .pv-range-btn {
+              font-size: 13.5px;
+              min-height: 38px;
+              padding: 7px 14px;
+            }
+
+            .pv-range-btn.pv-day-nav {
+              min-width: 40px;
+              padding: 7px 12px;
+            }
+
+            .pv-range-btn.pv-day-nav svg {
+              width: 17px;
+              height: 17px;
+            }
+
+            .pv-range-btn.pv-day-current {
+              min-width: 82px;
+            }
+          }
+
           .pv-chart-legend {
             display: flex;
             align-items: center;
             flex-wrap: wrap;
-            gap: 10px;
-            font-size: 11px;
-            color: #94a3b8;
+            gap: 12px;
+            font-size: 13px;
+            color: #cbd5e1;
           }
 
           .pv-legend-item {
             display: inline-flex;
             align-items: center;
-            gap: 5px;
+            gap: 6px;
           }
 
           .pv-legend-dot {
-            width: 8px;
-            height: 8px;
+            width: 9px;
+            height: 9px;
             border-radius: 50%;
             flex-shrink: 0;
           }
@@ -2286,8 +3373,8 @@
             display: flex;
             align-items: center;
             flex-wrap: wrap;
-            gap: 8px;
-            font-size: 11px;
+            gap: 10px;
+            font-size: 13px;
             font-variant-numeric: tabular-nums;
           }
 
@@ -2307,9 +3394,9 @@
           }
 
           .pv-delta-badge {
-            font-size: 10px;
+            font-size: 11.5px;
             font-weight: 600;
-            padding: 1px 6px;
+            padding: 2px 7px;
             border-radius: 4px;
             font-variant-numeric: tabular-nums;
           }
@@ -2360,6 +3447,733 @@
 
           .pv-chart-tooltip.visible {
             opacity: 1;
+          }
+
+          .pv-legend-dot.soc {
+            background: #c084fc;
+            box-shadow: 0 0 6px rgba(192, 132, 252, 0.55);
+          }
+
+          .pv-legend-dot.soc-actual {
+            background: #f472b6;
+            box-shadow: 0 0 6px rgba(244, 114, 182, 0.55);
+          }
+
+          .pv-soc-toggle-btn {
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            background: rgba(255, 255, 255, 0.04);
+            color: #94a3b8;
+            font-size: 12px;
+            font-weight: 500;
+            padding: 4px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-family: inherit;
+          }
+
+          .pv-soc-toggle-btn.active {
+            background: rgba(192, 132, 252, 0.2);
+            border-color: rgba(192, 132, 252, 0.45);
+            color: #f3e8ff;
+            font-weight: 600;
+          }
+
+          .pv-batt-strip {
+            margin-top: 10px;
+            padding: 12px 14px;
+            border-radius: 10px;
+            border: 1px solid rgba(192, 132, 252, 0.25);
+            background: rgba(15, 20, 32, 0.82);
+            display: none;
+            flex-direction: column;
+            gap: 10px;
+          }
+
+          .pv-batt-strip.is-visible {
+            display: flex;
+          }
+
+          .pv-batt-head {
+            display: flex;
+            align-items: center;
+            justify-content: flex-start;
+            gap: 12px;
+            flex-wrap: wrap;
+            font-size: 13px;
+          }
+
+          .pv-batt-title {
+            font-weight: 700;
+            color: #e9d5ff;
+            font-size: 14px;
+          }
+
+
+          .pv-batt-dual {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 14px;
+            padding: 6px 0 4px;
+          }
+
+          .pv-batt-dual.single {
+            grid-template-columns: minmax(0, 650px);
+            justify-content: center;
+          }
+
+          @media (max-width: 540px) {
+            .pv-batt-dual {
+              grid-template-columns: 1fr;
+            }
+          }
+
+          .pv-batt-box {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 14px 16px 14px;
+            border-radius: 10px;
+            background: rgba(8, 13, 25, 0.72);
+            border: 1px solid rgba(148, 163, 184, 0.16);
+          }
+
+          .pv-batt-main-split {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(168px, auto);
+            align-items: center;
+            gap: 18px;
+            width: 100%;
+          }
+
+          .pv-batt-left-col {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-width: 0;
+          }
+
+          .pv-batt-balance-col {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            gap: 4px;
+            padding-left: 18px;
+            border-left: 1px solid rgba(148, 163, 184, 0.22);
+            font-variant-numeric: tabular-nums;
+          }
+
+          .pv-batt-balance-lbl {
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: #94a3b8;
+          }
+
+          .pv-batt-balance-range {
+            font-size: 12px;
+            font-weight: 600;
+            color: #cbd5e1;
+          }
+
+          .pv-batt-balance-pct {
+            margin-top: 2px;
+            font-size: 42px;
+            font-weight: 800;
+            line-height: 1;
+            color: #f8fafc;
+          }
+
+          .pv-batt-balance-pct.pos {
+            color: #34d399;
+          }
+
+          .pv-batt-balance-pct.neg {
+            color: #fbbf24;
+          }
+
+          .pv-batt-balance-pct.flat {
+            color: #e2e8f0;
+          }
+
+          .pv-batt-balance-kwh {
+            font-size: 17px;
+            font-weight: 700;
+            color: #cbd5e1;
+          }
+
+          .pv-batt-balance-kwh.pos {
+            color: #6ee7b7;
+          }
+
+          .pv-batt-balance-kwh.neg {
+            color: #fde68a;
+          }
+
+          .pv-batt-balance-sub {
+            margin-top: 2px;
+            font-size: 12px;
+            font-weight: 600;
+            color: #94a3b8;
+            white-space: nowrap;
+          }
+
+          @media (max-width: 580px) {
+            .pv-batt-main-split {
+              grid-template-columns: 1fr;
+              gap: 14px;
+            }
+            .pv-batt-balance-col {
+              padding-left: 0;
+              padding-top: 12px;
+              border-left: none;
+              border-top: 1px solid rgba(148, 163, 184, 0.22);
+            }
+          }
+
+          .pv-batt-outside-readout {
+            display: flex;
+            align-items: baseline;
+            justify-content: center;
+            gap: 10px;
+            margin-bottom: 6px;
+            font-variant-numeric: tabular-nums;
+          }
+
+          .pv-batt-outside-pct {
+            font-size: 32px;
+            font-weight: 800;
+            line-height: 1;
+            color: #ffffff;
+          }
+
+          .pv-batt-outside-pct.prog {
+            color: #f3e8ff;
+          }
+
+          .pv-batt-outside-pct.ist {
+            color: #6ee7b7;
+          }
+
+          .pv-batt-outside-kwh {
+            font-size: 14px;
+            font-weight: 600;
+            color: #cbd5e1;
+          }
+
+          .pv-batt-minmax-split {
+            display: grid;
+            grid-template-columns: 1fr auto 1fr;
+            align-items: center;
+            width: 100%;
+            gap: 10px;
+            margin-bottom: 6px;
+            font-variant-numeric: tabular-nums;
+          }
+
+          .pv-batt-minmax-split.three {
+            grid-template-columns: 1fr auto 1fr auto 1fr;
+            gap: 8px;
+          }
+
+          .pv-batt-minmax-col {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 2px;
+          }
+
+          .pv-batt-minmax-sep {
+            width: 1px;
+            min-width: 1px;
+            flex-shrink: 0;
+            height: 44px;
+            background: rgba(148, 163, 184, 0.26);
+          }
+
+          .pv-batt-minmax-tag {
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: #94a3b8;
+          }
+
+          .pv-batt-minmax-tag.now {
+            color: #e2e8f0;
+          }
+
+          .pv-batt-minmax-tag.max {
+            color: #6ee7b7;
+          }
+
+          .pv-batt-minmax-pct {
+            font-size: 26px;
+            font-weight: 800;
+            line-height: 1.05;
+            color: #f8fafc;
+          }
+
+          .pv-batt-minmax-pct.now {
+            color: #34d399;
+          }
+
+          .pv-batt-minmax-pct.max {
+            color: #6ee7b7;
+          }
+
+          .pv-batt-minmax-meta {
+            font-size: 12px;
+            font-weight: 600;
+            color: #cbd5e1;
+            text-align: center;
+          }
+
+          .pv-batt-svg {
+            width: 100%;
+            max-width: 310px;
+            height: 215px;
+            display: block;
+            overflow: visible;
+            font-variant-numeric: tabular-nums;
+          }
+
+          .pv-batt-big-title {
+            margin-top: 4px;
+            font-size: 18px;
+            font-weight: 800;
+            letter-spacing: 0.02em;
+            color: #f8fafc;
+          }
+
+          .pv-batt-big-title.prog {
+            color: #e9d5ff;
+          }
+
+          .pv-batt-big-title.ist {
+            color: #6ee7b7;
+          }
+
+          .pv-batt-big-sub {
+            margin-top: 2px;
+            font-size: 13px;
+            font-weight: 600;
+            color: #cbd5e1;
+            font-variant-numeric: tabular-nums;
+          }
+
+          .pv-batt-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 10px;
+            padding-top: 8px;
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+          }
+
+          @media (max-width: 640px) {
+            .pv-batt-grid {
+              grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+          }
+
+          .pv-batt-item {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            font-variant-numeric: tabular-nums;
+          }
+
+          .pv-batt-lbl {
+            font-size: 11.5px;
+            color: #94a3b8;
+          }
+
+          .pv-batt-val {
+            font-size: 14px;
+            font-weight: 700;
+            color: #f8fafc;
+          }
+
+          .pv-batt-val.good {
+            color: #34d399;
+          }
+
+          .pv-batt-val.warn {
+            color: #fbbf24;
+          }
+
+          .pv-batt-val.soc {
+            color: #d8b4fe;
+          }
+
+          .pv-batt-sub {
+            font-size: 11.5px;
+            color: #94a3b8;
+          }
+
+          .pv-batt-forecast-wrap {
+            padding-top: 10px;
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+          }
+
+          .pv-batt-forecast-head {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: 8px;
+            flex-wrap: wrap;
+            font-variant-numeric: tabular-nums;
+          }
+
+          .pv-batt-forecast-title {
+            font-size: 13px;
+            font-weight: 700;
+            color: #e9d5ff;
+          }
+
+          .pv-batt-forecast-summary {
+            font-size: 12px;
+            color: #cbd5e1;
+          }
+
+          .pv-batt-forecast-summary strong {
+            color: #d8b4fe;
+            font-weight: 700;
+          }
+
+          .pv-batt-forecast-grid {
+            display: grid;
+            grid-template-columns: repeat(6, minmax(0, 1fr));
+            gap: 8px;
+            overflow-x: auto;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+          }
+
+          @media (max-width: 520px) {
+            .pv-batt-forecast-grid {
+              grid-template-columns: repeat(6, minmax(74px, 1fr));
+              padding-bottom: 4px;
+            }
+          }
+
+          .pv-batt-day-cell {
+            appearance: none;
+            border: 1px solid rgba(148, 163, 184, 0.14);
+            background: rgba(8, 13, 25, 0.65);
+            border-radius: 8px;
+            padding: 8px 6px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 5px;
+            cursor: pointer;
+            font-family: inherit;
+            color: inherit;
+            font-variant-numeric: tabular-nums;
+            transition: background 0.15s ease, border-color 0.15s ease;
+          }
+
+          .pv-batt-day-cell:hover {
+            background: rgba(30, 41, 59, 0.72);
+            border-color: rgba(192, 132, 252, 0.4);
+          }
+
+          .pv-batt-day-cell.is-selected {
+            background: rgba(56, 189, 248, 0.12);
+            border-color: rgba(56, 189, 248, 0.55);
+          }
+
+          .pv-batt-day-kwh {
+            font-size: 13px;
+            font-weight: 800;
+            color: #f8fafc;
+            white-space: nowrap;
+          }
+
+          .pv-batt-day-track {
+            width: 28px;
+            height: 46px;
+            border-radius: 5px;
+            background: rgba(255, 255, 255, 0.08);
+            display: flex;
+            align-items: flex-end;
+            overflow: hidden;
+          }
+
+          .pv-batt-day-fill {
+            width: 100%;
+            border-radius: 3px;
+            background: linear-gradient(180deg, #d8b4fe 0%, #9333ea 100%);
+            transition: height 0.2s ease;
+          }
+
+          .pv-batt-day-foot {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            line-height: 1.2;
+          }
+
+          .pv-batt-day-name {
+            font-size: 11.5px;
+            font-weight: 700;
+            color: #e2e8f0;
+          }
+
+          .pv-batt-day-cell.is-selected .pv-batt-day-name {
+            color: #38bdf8;
+          }
+
+          .pv-batt-day-date {
+            font-size: 10px;
+            color: #64748b;
+          }
+
+          .pv-batt-30d-wrap {
+            padding-top: 10px;
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+          }
+
+          .pv-batt-30d-summary-pos {
+            color: #34d399;
+            font-weight: 700;
+          }
+
+          .pv-batt-30d-summary-neg {
+            color: #fbbf24;
+            font-weight: 700;
+          }
+
+          .pv-batt-30d-scroll {
+            overflow-x: auto;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+            padding-bottom: 2px;
+            min-width: 0;
+          }
+
+          .pv-batt-30d-chart {
+            display: grid;
+            grid-template-columns: 40px minmax(0, 1fr);
+            gap: 8px;
+            align-items: stretch;
+            font-variant-numeric: tabular-nums;
+          }
+
+          .pv-batt-30d-yaxis {
+            height: 140px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            align-items: flex-end;
+            padding-right: 4px;
+            font-size: 10.5px;
+            font-weight: 600;
+            line-height: 1;
+          }
+
+          .pv-batt-30d-y-pos {
+            color: #6ee7b7;
+          }
+
+          .pv-batt-30d-y-zero {
+            color: #f8fafc;
+            font-weight: 800;
+            font-size: 11px;
+            padding: 2px 5px;
+            border-radius: 4px;
+            background: rgba(15, 23, 42, 0.96);
+            border: 1px solid rgba(241, 245, 249, 0.45);
+          }
+
+          .pv-batt-30d-y-neg {
+            color: #fde68a;
+          }
+
+          .pv-batt-30d-body {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            min-width: 600px;
+          }
+
+          .pv-batt-30d-plot {
+            position: relative;
+            height: 140px;
+            border-radius: 6px;
+            background: rgba(8, 13, 25, 0.72);
+            border: 1px solid rgba(148, 163, 184, 0.14);
+            display: grid;
+            grid-template-columns: repeat(30, minmax(0, 1fr));
+            gap: 2px;
+            padding: 0 3px;
+            overflow: hidden;
+          }
+
+          .pv-batt-30d-guide-top,
+          .pv-batt-30d-guide-bot {
+            position: absolute;
+            left: 0;
+            right: 0;
+            height: 1px;
+            border-top: 1px dashed rgba(148, 163, 184, 0.16);
+            pointer-events: none;
+            z-index: 1;
+          }
+
+          .pv-batt-30d-guide-top {
+            top: 14px;
+          }
+
+          .pv-batt-30d-guide-bot {
+            bottom: 14px;
+          }
+
+          .pv-batt-30d-zero-line {
+            position: absolute;
+            left: 0;
+            right: 0;
+            top: 50%;
+            height: 2px;
+            margin-top: -1px;
+            background: rgba(241, 245, 249, 0.78);
+            box-shadow: 0 0 8px rgba(248, 250, 252, 0.28);
+            pointer-events: none;
+            z-index: 3;
+          }
+
+          .pv-batt-30d-col {
+            appearance: none;
+            border: none;
+            background: transparent;
+            padding: 0;
+            margin: 0;
+            height: 100%;
+            position: relative;
+            cursor: pointer;
+            z-index: 2;
+            border-radius: 3px;
+            transition: background 0.12s ease;
+          }
+
+          .pv-batt-30d-col:hover {
+            background: rgba(148, 163, 184, 0.14);
+          }
+
+          .pv-batt-30d-col.is-selected {
+            background: rgba(56, 189, 248, 0.16);
+            box-shadow: inset 0 0 0 1px rgba(56, 189, 248, 0.55);
+          }
+
+          .pv-batt-30d-half-pos {
+            position: absolute;
+            left: 1px;
+            right: 1px;
+            top: 4px;
+            bottom: 50%;
+            display: flex;
+            align-items: flex-end;
+            justify-content: center;
+          }
+
+          .pv-batt-30d-half-neg {
+            position: absolute;
+            left: 1px;
+            right: 1px;
+            top: 50%;
+            bottom: 4px;
+            display: flex;
+            align-items: flex-start;
+            justify-content: center;
+          }
+
+          .pv-batt-30d-bar {
+            width: 100%;
+            transition: height 0.2s ease, opacity 0.15s ease;
+          }
+
+          .pv-batt-30d-bar.pos {
+            border-radius: 3px 3px 0 0;
+            background: linear-gradient(180deg, #6ee7b7 0%, #059669 100%);
+          }
+
+          .pv-batt-30d-bar.neg {
+            border-radius: 0 0 3px 3px;
+            background: linear-gradient(180deg, #f59e0b 0%, #b45309 100%);
+          }
+
+          .pv-batt-30d-zero-dot {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 6px;
+            height: 6px;
+            margin-left: -3px;
+            margin-top: -3px;
+            border-radius: 50%;
+            background: #e2e8f0;
+            z-index: 4;
+          }
+
+          .pv-batt-30d-nodata {
+            position: absolute;
+            top: 50%;
+            left: 20%;
+            right: 20%;
+            height: 2px;
+            margin-top: -1px;
+            background: rgba(100, 116, 139, 0.35);
+            z-index: 4;
+          }
+
+          .pv-batt-30d-xaxis {
+            display: grid;
+            grid-template-columns: repeat(30, minmax(0, 1fr));
+            gap: 2px;
+            padding: 0 3px;
+            font-size: 9.5px;
+            color: #64748b;
+            text-align: center;
+          }
+
+          .pv-batt-30d-tick.is-selected {
+            color: #38bdf8;
+            font-weight: 700;
+          }
+
+          .pv-batt-30d-readout {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 6px;
+            font-size: 12px;
+            color: #cbd5e1;
+            font-variant-numeric: tabular-nums;
+          }
+
+          .pv-batt-30d-empty {
+            font-size: 12px;
+            color: #94a3b8;
+            padding: 8px 10px;
+            border-radius: 6px;
+            background: rgba(8, 13, 25, 0.55);
+            border: 1px solid rgba(148, 163, 184, 0.14);
+          }
+
+          .pv-hour-soc {
+            font-size: 9px;
+            color: #d8b4fe;
+            font-weight: 600;
           }
 
           .pv-hourly-grid {
@@ -2658,6 +4472,7 @@
 
         <ha-card class="card-shell" id="card-shell">
           <div class="pv-panel" id="pv-panel">
+            <div class="pv-panel-inner" id="pv-panel-inner">
             <div class="pv-summary-row">
               <div class="pv-main">
                 <div class="pv-cause-line">
@@ -2700,29 +4515,36 @@
                 </button>
               </div>
             </div>
-            <div class="pv-chart-box" id="pv-chart-box">
-              <div class="pv-chart-header">
-                <div class="pv-chart-left">
-                  <span class="pv-chart-title">Ertragsverlauf</span>
-                  <div class="pv-range-switch" role="group" aria-label="Tag wählen">
-                    <button type="button" class="pv-range-btn pv-day-nav" id="btn-pv-prev-day" title="Einen Tag zurück" aria-label="Vorheriger Tag">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+            <div class="pv-fs-pv-col" id="pv-fs-pv-col">
+              <div class="pv-chart-box" id="pv-chart-box">
+                <div class="pv-chart-header">
+                  <div class="pv-chart-left">
+                    <div class="pv-range-switch" role="group" aria-label="Tag wählen">
+                      <button type="button" class="pv-range-btn pv-day-nav" id="btn-pv-prev-day" data-day-switch-prev title="Einen Tag zurück" aria-label="Vorheriger Tag">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+                      </button>
+                      <button type="button" class="pv-range-btn pv-day-current active" id="btn-pv-day-label" data-day-switch-label title="Heute">Heute</button>
+                      <button type="button" class="pv-range-btn pv-day-nav" id="btn-pv-next-day" data-day-switch-next title="Einen Tag vor" aria-label="Nächster Tag">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+                      </button>
+                    </div>
+                    <span class="pv-chart-title">Ertragsverlauf</span>
+                    <button type="button" class="pv-soc-toggle-btn" id="btn-toggle-soc" hidden title="Batteriespeicher-SoC Kurve im Diagramm ein-/ausblenden">
+                      Speicher-SoC
                     </button>
-                    <button type="button" class="pv-range-btn pv-day-current active" id="btn-pv-day-label" title="Heute">Heute</button>
-                    <button type="button" class="pv-range-btn pv-day-nav" id="btn-pv-next-day" title="Einen Tag vor" aria-label="Nächster Tag">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
-                    </button>
+                    <div class="pv-chart-legend" id="pv-chart-legend"></div>
                   </div>
-                  <div class="pv-chart-legend" id="pv-chart-legend"></div>
+                  <div class="pv-chart-totals" id="pv-chart-totals"></div>
                 </div>
-                <div class="pv-chart-totals" id="pv-chart-totals"></div>
+                <div class="pv-chart-stage" id="pv-chart-stage">
+                  <svg class="pv-chart-svg" id="pv-chart-svg" viewBox="0 0 720 186"></svg>
+                  <div class="pv-chart-tooltip" id="pv-chart-tooltip"></div>
+                </div>
               </div>
-              <div class="pv-chart-stage" id="pv-chart-stage">
-                <svg class="pv-chart-svg" id="pv-chart-svg" viewBox="0 0 720 186" preserveAspectRatio="none"></svg>
-                <div class="pv-chart-tooltip" id="pv-chart-tooltip"></div>
-              </div>
+              <div class="pv-hourly-grid" id="pv-hourly-grid"></div>
             </div>
-            <div class="pv-hourly-grid" id="pv-hourly-grid"></div>
+            <div class="pv-batt-strip" id="pv-batt-strip"></div>
+            </div>
           </div>
 
           <div class="map-stage" id="map-stage">
@@ -2953,8 +4775,68 @@
         });
       }
 
+      const btnToggleSoc = this.shadowRoot.getElementById('btn-toggle-soc');
+      if (btnToggleSoc) {
+        btnToggleSoc.addEventListener('click', () => {
+          this._showBatterySocInChart = !this._showBatterySocInChart;
+          if (this._pvData) {
+            this._renderPvPanel();
+          }
+        });
+      }
+
+      const battStripEl = this.shadowRoot.getElementById('pv-batt-strip');
+      if (battStripEl) {
+        battStripEl.addEventListener('click', (e) => {
+          const navBtn = e.target?.closest?.('[data-batt-day-nav]');
+          if (navBtn) {
+            const action = navBtn.getAttribute('data-batt-day-nav');
+            if (action === 'prev') {
+              this._setPvDayOffset(this._pvDayOffset - 1);
+            } else if (action === 'next') {
+              this._setPvDayOffset(this._pvDayOffset + 1);
+            } else if (action === 'today' && this._pvDayOffset !== 0) {
+              this._setPvDayOffset(0);
+            }
+            return;
+          }
+          const btn = e.target?.closest?.('[data-day-offset]');
+          if (!btn) return;
+          const nextOff = Number(btn.getAttribute('data-day-offset'));
+          if (Number.isFinite(nextOff)) {
+            this._setPvDayOffset(nextOff);
+          }
+        });
+        battStripEl.addEventListener('mouseover', (e) => {
+          const col = e.target?.closest?.('.pv-batt-30d-col');
+          if (!col) return;
+          const readout = battStripEl.querySelector('#pv-batt-30d-readout');
+          const info = col.getAttribute('data-readout');
+          if (readout && info) {
+            readout.innerHTML = info;
+          }
+        });
+        battStripEl.addEventListener('mouseleave', () => {
+          const readout = battStripEl.querySelector('#pv-batt-30d-readout');
+          const defHtml = readout?.getAttribute('data-default-readout');
+          if (readout && defHtml) {
+            readout.innerHTML = defHtml;
+          }
+        });
+      }
+
       this._attachFullscreenListeners();
       this._bindPvChartEvents();
+      const pvPanelEl = this.shadowRoot.getElementById('pv-panel');
+      if (pvPanelEl && typeof ResizeObserver !== 'undefined') {
+        if (this._pvPanelResizeObserver) {
+          this._pvPanelResizeObserver.disconnect();
+        }
+        this._pvPanelResizeObserver = new ResizeObserver(() => {
+          this._fitPvFullscreen();
+        });
+        this._pvPanelResizeObserver.observe(pvPanelEl);
+      }
     }
 
     _bindPvChartEvents() {
@@ -2968,6 +4850,7 @@
         const dotIdeal = this.shadowRoot?.getElementById('pv-chart-dot-ideal');
         const dotForecast = this.shadowRoot?.getElementById('pv-chart-dot-forecast');
         const dotActual = this.shadowRoot?.getElementById('pv-chart-dot-actual');
+        const dotSoc = this.shadowRoot?.getElementById('pv-chart-dot-soc');
         if (!model || !model.slots.length || !tooltip) return;
 
         const rect = stage.getBoundingClientRect();
@@ -3013,6 +4896,15 @@
             dotActual.setAttribute('opacity', '0');
           }
         }
+        if (dotSoc) {
+          if (slot.ySoc !== null && slot.ySoc !== undefined) {
+            dotSoc.setAttribute('cx', slot.x.toFixed(1));
+            dotSoc.setAttribute('cy', slot.ySoc.toFixed(1));
+            dotSoc.setAttribute('opacity', '1');
+          } else {
+            dotSoc.setAttribute('opacity', '0');
+          }
+        }
 
         const unitLabel = model.hasPvSystem ? 'W' : 'W/m²';
         const fmtVal = (v) =>
@@ -3045,6 +4937,17 @@
                 .join(' · ')}</div>`
             : '';
 
+        let battLine = '';
+        if (
+          slot.batt &&
+          slot.batt.socActualPct !== null &&
+          slot.batt.socActualPct !== undefined
+        ) {
+          battLine = `<div><span style="color:#34d399">●</span> Ist-SoC: <strong>${Math.round(
+            slot.batt.socActualPct
+          )}%</strong></div>`;
+        }
+
         tooltip.innerHTML =
           `<div style="font-weight:600;color:#f8fafc">${this._escapeHtml(slot.fullTimeLabel)} Uhr</div>` +
           (slot.idealVal !== undefined
@@ -3054,13 +4957,15 @@
           (slot.actualVal !== null
             ? `<div><span style="color:#fbbf24">●</span> Ist: <strong>${fmtVal(slot.actualVal)}</strong>${deltaHtml}</div>`
             : '') +
+          battLine +
           stringLine +
           `<div style="color:#94a3b8;font-size:10px">☀ ${slot.sunMin} min · Wolken ${slot.clouds}%${tempTxt}${shadeTxt}</div>`;
 
-        const pxX = (slot.x / model.svgW) * rect.width;
-        const placeRight = pxX < rect.width * 0.62;
-        tooltip.style.left = placeRight ? `${Math.min(rect.width - 170, pxX + 12)}px` : 'auto';
-        tooltip.style.right = placeRight ? 'auto' : `${Math.max(8, rect.width - pxX + 12)}px`;
+        const stageW = stage.clientWidth || rect.width;
+        const pxX = (slot.x / model.svgW) * stageW;
+        const placeRight = pxX < stageW * 0.62;
+        tooltip.style.left = placeRight ? `${Math.min(stageW - 190, pxX + 12)}px` : 'auto';
+        tooltip.style.right = placeRight ? 'auto' : `${Math.max(8, stageW - pxX + 12)}px`;
         tooltip.classList.add('visible');
       };
 
@@ -3070,11 +4975,13 @@
         const dotIdeal = this.shadowRoot?.getElementById('pv-chart-dot-ideal');
         const dotForecast = this.shadowRoot?.getElementById('pv-chart-dot-forecast');
         const dotActual = this.shadowRoot?.getElementById('pv-chart-dot-actual');
+        const dotSoc = this.shadowRoot?.getElementById('pv-chart-dot-soc');
         if (tooltip) tooltip.classList.remove('visible');
         if (crosshair) crosshair.setAttribute('opacity', '0');
         if (dotIdeal) dotIdeal.setAttribute('opacity', '0');
         if (dotForecast) dotForecast.setAttribute('opacity', '0');
         if (dotActual) dotActual.setAttribute('opacity', '0');
+        if (dotSoc) dotSoc.setAttribute('opacity', '0');
       };
 
       stage.addEventListener('pointermove', (e) => handleMove(e.clientX));
@@ -3129,6 +5036,14 @@
         };
         document.addEventListener('keydown', this._onFullscreenKeyDown);
       }
+      if (!this._onFullscreenResize) {
+        this._onFullscreenResize = () => {
+          if (this._fullscreenTarget === 'pv') {
+            this._fitPvFullscreen();
+          }
+        };
+        window.addEventListener('resize', this._onFullscreenResize, { passive: true });
+      }
     }
 
     _detachFullscreenListeners() {
@@ -3140,6 +5055,10 @@
       if (this._onFullscreenKeyDown) {
         document.removeEventListener('keydown', this._onFullscreenKeyDown);
         this._onFullscreenKeyDown = null;
+      }
+      if (this._onFullscreenResize) {
+        window.removeEventListener('resize', this._onFullscreenResize);
+        this._onFullscreenResize = null;
       }
     }
 
@@ -3258,6 +5177,7 @@
       }
       if (pvPanel) {
         pvPanel.classList.toggle('pseudo-fullscreen', this._pseudoFullscreenTarget === 'pv');
+        pvPanel.classList.toggle('is-pv-fullscreen', activeTarget === 'pv');
       }
       if (cardShell) {
         cardShell.classList.toggle('pseudo-fs', Boolean(this._pseudoFullscreenTarget));
@@ -3266,10 +5186,77 @@
 
       this._applyDimensions();
       this._updateFullscreenUI(activeTarget);
+      this._fitPvFullscreen();
+      if (activeTarget === 'pv') {
+        requestAnimationFrame(() => this._fitPvFullscreen());
+        setTimeout(() => this._fitPvFullscreen(), 80);
+      }
 
       if (this._map) {
         requestAnimationFrame(() => this._map && this._map.invalidateSize());
         setTimeout(() => this._map && this._map.invalidateSize(), 120);
+      }
+    }
+
+    _fitPvFullscreen() {
+      const pvPanel = this.shadowRoot?.getElementById('pv-panel');
+      const inner = this.shadowRoot?.getElementById('pv-panel-inner');
+      if (!pvPanel || !inner) return;
+
+      const battStripEl = this.shadowRoot?.getElementById('pv-batt-strip');
+      const hasBatt = Boolean(battStripEl && battStripEl.classList.contains('is-visible'));
+      pvPanel.classList.toggle('has-batt', hasBatt);
+      const panelW =
+        pvPanel.clientWidth ||
+        pvPanel.getBoundingClientRect().width ||
+        this.clientWidth ||
+        this.getBoundingClientRect().width ||
+        0;
+      pvPanel.classList.toggle('is-wide-layout', panelW >= 960);
+
+      const isPvFs = this._fullscreenTarget === 'pv';
+      pvPanel.classList.toggle('is-pv-fullscreen', isPvFs);
+      if (!isPvFs) {
+        inner.style.transform = '';
+        inner.style.width = '';
+        inner.style.transformOrigin = '';
+        pvPanel.style.overflowY = '';
+        return;
+      }
+
+      inner.style.transform = '';
+      inner.style.width = '';
+      inner.style.transformOrigin = 'top left';
+      pvPanel.style.overflowY = 'hidden';
+
+      const cs = getComputedStyle(pvPanel);
+      const padX = (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0);
+      const padY = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+      const availW = Math.max(240, pvPanel.clientWidth - padX);
+      const availH = Math.max(200, pvPanel.clientHeight - padY);
+      if (availW <= 0 || availH <= 0) return;
+
+      const h1 = inner.scrollHeight;
+      const w1 = inner.scrollWidth;
+      let scale = Math.min(1, availH / Math.max(1, h1), availW / Math.max(1, w1));
+
+      if (scale < 0.995) {
+        const passScale = Math.max(0.45, scale);
+        inner.style.width = `${(availW / passScale).toFixed(2)}px`;
+        const h2 = inner.scrollHeight;
+        const w2 = inner.scrollWidth;
+        scale = Math.min(1, availH / Math.max(1, h2), availW / Math.max(1, w2));
+        const finalScale = Math.max(0.45, scale);
+        if (scale < 0.45) {
+          pvPanel.style.overflowY = 'auto';
+        }
+        inner.style.width = `${(availW / finalScale).toFixed(2)}px`;
+        inner.style.transform = `scale(${finalScale.toFixed(4)})`;
+      }
+
+      const scroll30dEl = this.shadowRoot?.getElementById('pv-batt-30d-scroll');
+      if (scroll30dEl && (this._pv30dScrollFromRight ?? 0) <= 8) {
+        scroll30dEl.scrollLeft = scroll30dEl.scrollWidth;
       }
     }
 
@@ -4153,27 +6140,24 @@
 
     _updatePvDayButtonsUI() {
       if (!this.shadowRoot) return;
-      const btnPrev = this.shadowRoot.getElementById('btn-pv-prev-day');
-      const btnLabel = this.shadowRoot.getElementById('btn-pv-day-label');
-      const btnNext = this.shadowRoot.getElementById('btn-pv-next-day');
-
       const off = this._pvDayOffset || 0;
       const maxFuture = this._getMaxFutureDayOffset();
       const todayStr = this._getSiteTodayDateStr();
       const targetStr = this._shiftDateStr(todayStr, off);
+      const labelText = this._formatShortPastDate(targetStr, off);
 
-      if (btnLabel) {
-        btnLabel.textContent = this._formatShortPastDate(targetStr, off);
+      this.shadowRoot.querySelectorAll('[data-day-switch-label]').forEach((btnLabel) => {
+        btnLabel.textContent = labelText;
         btnLabel.classList.add('active');
         btnLabel.classList.toggle('is-past', off < 0);
         btnLabel.title = off === 0 ? 'Heute' : 'Zurück zu Heute';
-      }
-      if (btnPrev) {
+      });
+      this.shadowRoot.querySelectorAll('[data-day-switch-prev]').forEach((btnPrev) => {
         btnPrev.disabled = off <= -30;
-      }
-      if (btnNext) {
+      });
+      this.shadowRoot.querySelectorAll('[data-day-switch-next]').forEach((btnNext) => {
         btnNext.disabled = off >= maxFuture;
-      }
+      });
     }
 
     _setPvDayOffset(nextOffset) {
@@ -4181,6 +6165,9 @@
       const clamped = Math.max(-30, Math.min(maxFuture, Number(nextOffset) || 0));
       if (clamped === this._pvDayOffset) return;
       this._pvDayOffset = clamped;
+      if (clamped >= 0) {
+        this._pv30dScrollFromRight = 0;
+      }
       this._updatePvDayButtonsUI();
 
       if (clamped < 0 && -clamped > this._pvOpenMeteoPastDays) {
@@ -4754,6 +6741,9 @@
         if (this._getConfiguredActualEntities().length > 0) {
           this._fetchPvActualHistory(false);
         }
+        if (this._config.battery_system?.enabled && this._config.battery_system?.soc_entity) {
+          this._fetchBatt30dHistory(false);
+        }
         if (this._config.weather_entity) {
           this._fetchWeatherEntityForecast(false);
         }
@@ -4773,14 +6763,15 @@
       }
     }
 
-    async _fetchSingleEntityHistory(entityId, startIso, endIso) {
+    async _fetchSingleEntityHistory(entityId, startIso, endIso, significantOnly = false) {
       const stateObj = this._hass?.states?.[entityId];
       const hasAttrs = Boolean(stateObj?.attributes);
       const path =
         `history/period/${encodeURIComponent(startIso)}` +
         `?end_time=${encodeURIComponent(endIso)}` +
         `&filter_entity_id=${encodeURIComponent(entityId)}` +
-        `&minimal_response&significant_changes_only=0` +
+        `&minimal_response` +
+        (significantOnly ? '' : '&significant_changes_only=0') +
         (hasAttrs ? '&no_attributes' : '');
 
       try {
@@ -4793,12 +6784,16 @@
         const unitRaw = String(attrs.unit_of_measurement || '').trim();
         const unitLow = unitRaw.toLowerCase();
         const devClass = String(attrs.device_class || '').toLowerCase();
+        const isPercent = devClass === 'battery' || unitLow === '%';
         const isEnergy =
-          devClass === 'energy' || unitLow === 'kwh' || unitLow === 'wh' || unitLow === 'mwh';
+          !isPercent &&
+          (devClass === 'energy' || unitLow === 'kwh' || unitLow === 'wh' || unitLow === 'mwh');
 
         let scale = 1;
-        if (unitLow === 'kw' || unitLow === 'kwh') scale = 1000;
-        else if (unitLow === 'mw' || unitLow === 'mwh') scale = 1000000;
+        if (!isPercent) {
+          if (unitLow === 'kw' || unitLow === 'kwh') scale = 1000;
+          else if (unitLow === 'mw' || unitLow === 'mwh') scale = 1000000;
+        }
 
         const points = [];
         for (const pt of rawSeries) {
@@ -4808,7 +6803,12 @@
           const rawTs = pt.last_changed || pt.lc || pt.last_updated || pt.lu;
           const ts = Date.parse(rawTs);
           if (Number.isFinite(num) && Number.isFinite(ts)) {
-            points.push({ t: ts, v: isEnergy ? num * scale : Math.max(0, num * scale) });
+            const val = isPercent
+              ? Math.min(100, Math.max(0, num))
+              : isEnergy
+              ? num * scale
+              : Math.max(0, num * scale);
+            points.push({ t: ts, v: val });
           }
         }
         points.sort((a, b) => a.t - b.t);
@@ -4816,7 +6816,7 @@
         return {
           entityId,
           friendlyName: String(attrs.friendly_name || entityId),
-          unitType: isEnergy ? 'energy' : 'power',
+          unitType: isPercent ? 'percent' : isEnergy ? 'energy' : 'power',
           unitRaw,
           scale,
           points,
@@ -4828,18 +6828,21 @@
         const unitRaw = String(attrs.unit_of_measurement || '').trim();
         const unitLow = unitRaw.toLowerCase();
         const devClass = String(attrs.device_class || '').toLowerCase();
+        const isPercent = devClass === 'battery' || unitLow === '%';
         const isEnergy =
-          devClass === 'energy' || unitLow === 'kwh' || unitLow === 'wh' || unitLow === 'mwh';
-        const scale =
-          unitLow === 'kw' || unitLow === 'kwh'
-            ? 1000
-            : unitLow === 'mw' || unitLow === 'mwh'
-            ? 1000000
-            : 1;
+          !isPercent &&
+          (devClass === 'energy' || unitLow === 'kwh' || unitLow === 'wh' || unitLow === 'mwh');
+        const scale = isPercent
+          ? 1
+          : unitLow === 'kw' || unitLow === 'kwh'
+          ? 1000
+          : unitLow === 'mw' || unitLow === 'mwh'
+          ? 1000000
+          : 1;
         return {
           entityId,
           friendlyName: String(attrs.friendly_name || entityId),
-          unitType: isEnergy ? 'energy' : 'power',
+          unitType: isPercent ? 'percent' : isEnergy ? 'energy' : 'power',
           unitRaw,
           scale,
           points: [],
@@ -4910,7 +6913,8 @@
         entityIds.length === 0 ||
         !this._hass ||
         typeof this._hass.callApi !== 'function' ||
-        this._pvPastFetchingDates.has(targetDateStr)
+        this._pvPastFetchingDates.has(targetDateStr) ||
+        this._pvPastAttemptedDates.has(targetDateStr)
       ) {
         return;
       }
@@ -4924,6 +6928,7 @@
       const endIso = new Date(dayStartMs + 86400000 + 1800000).toISOString();
 
       this._pvPastFetchingDates.add(targetDateStr);
+      this._pvPastAttemptedDates.add(targetDateStr);
       try {
         const results = await Promise.all(
           entityIds.map((eid) => this._fetchSingleEntityHistory(eid, startIso, endIso))
@@ -4934,12 +6939,310 @@
             this._pvPastHistories.set(`${item.entityId}::${targetDateStr}`, item);
           }
         }
-        if (this._pvData && this._pvDayOffset < 0) {
+        if (this._pvData) {
           this._renderPvPanel();
         }
       } finally {
         this._pvPastFetchingDates.delete(targetDateStr);
       }
+    }
+
+    async _fetchBatt30dHistory(force = false) {
+      const socEntity = this._config?.battery_system?.enabled
+        ? String(this._config?.battery_system?.soc_entity || '').trim()
+        : '';
+      if (
+        !socEntity ||
+        !this._hass ||
+        typeof this._hass.callApi !== 'function' ||
+        this._pvBatt30dFetching
+      ) {
+        return;
+      }
+
+      const now = Date.now();
+      const existing = this._pvBatt30dHistory;
+      if (
+        !force &&
+        existing &&
+        existing.entityId === socEntity &&
+        now - (existing.fetchedAt || 0) < 300000
+      ) {
+        return;
+      }
+
+      this._pvBatt30dFetching = true;
+      try {
+        const utcOffset = Number(this._pvData?.utc_offset_seconds ?? 0);
+        const todayStr = this._getSiteTodayDateStr();
+        const startDateStr = this._shiftDateStr(todayStr, -29);
+        const parsedStart = startDateStr ? Date.parse(`${startDateStr}T00:00:00Z`) : NaN;
+        const startMs = Number.isFinite(parsedStart)
+          ? parsedStart - utcOffset * 1000 - 6 * 3600000
+          : now - 30 * 86400000 - 6 * 3600000;
+        const startIso = new Date(startMs).toISOString();
+        const endIso = new Date(now).toISOString();
+
+        const item = await this._fetchSingleEntityHistory(socEntity, startIso, endIso, true);
+        if (this._isDestroyed) return;
+        if (item) {
+          this._pvBatt30dHistory = item;
+          if (this._pvData) {
+            this._renderPvPanel();
+          }
+        }
+      } finally {
+        this._pvBatt30dFetching = false;
+      }
+    }
+
+    _compute30DayBatteryBalance({
+      todayDateStr,
+      utcOffset,
+      batteryCfg,
+      liveSocPct,
+    }) {
+      if (!todayDateStr || !batteryCfg?.enabled || batteryCfg.capacity_kwh <= 0) return [];
+      const socEntity = String(batteryCfg.soc_entity || '').trim();
+      const capKwh = Number(batteryCfg.capacity_kwh) || 10;
+      const weekdayShortNames = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
+      const nowMs = Date.now();
+
+      // Merge 30d history + today's live history + any individual past day history
+      const rawPoints = [];
+      if (socEntity) {
+        if (this._pvBatt30dHistory?.entityId === socEntity && Array.isArray(this._pvBatt30dHistory.points)) {
+          rawPoints.push(...this._pvBatt30dHistory.points);
+        }
+        const todayPts = this._pvEntityHistories.get(socEntity)?.points;
+        if (Array.isArray(todayPts)) {
+          rawPoints.push(...todayPts);
+        }
+        for (const [k, hist] of this._pvPastHistories.entries()) {
+          if (k.startsWith(`${socEntity}::`) && Array.isArray(hist?.points)) {
+            rawPoints.push(...hist.points);
+          }
+        }
+      }
+      if (Number.isFinite(liveSocPct)) {
+        rawPoints.push({ t: nowMs, v: Math.min(100, Math.max(0, liveSocPct)) });
+      }
+
+      rawPoints.sort((a, b) => a.t - b.t);
+      const pts = [];
+      for (const p of rawPoints) {
+        if (!Number.isFinite(p?.t) || !Number.isFinite(p?.v)) continue;
+        const prev = pts[pts.length - 1];
+        if (prev && Math.abs(prev.t - p.t) < 5000) {
+          pts[pts.length - 1] = p;
+        } else {
+          pts.push(p);
+        }
+      }
+
+      const evalSocAt = (targetMs, fallbackMinMs, fallbackMaxMs) => {
+        if (!pts.length) return null;
+        let before = null;
+        let after = null;
+        for (let i = 0; i < pts.length; i++) {
+          const p = pts[i];
+          if (p.t <= targetMs) {
+            before = p;
+          } else {
+            after = p;
+            break;
+          }
+        }
+        if (before && after && targetMs - before.t <= 8 * 3600000 && after.t - targetMs <= 8 * 3600000) {
+          const span = after.t - before.t;
+          const frac = span > 0 ? (targetMs - before.t) / span : 0;
+          return Math.min(100, Math.max(0, before.v + (after.v - before.v) * frac));
+        }
+        if (before && targetMs - before.t <= 6 * 3600000) {
+          return Math.min(100, Math.max(0, before.v));
+        }
+        if (after && after.t - targetMs <= 6 * 3600000) {
+          return Math.min(100, Math.max(0, after.v));
+        }
+        // Fallback: earliest or latest inside window
+        const inWin = pts.filter((p) => p.t >= fallbackMinMs && p.t <= fallbackMaxMs);
+        if (inWin.length > 0) {
+          return Math.abs(targetMs - fallbackMinMs) <= Math.abs(fallbackMaxMs - targetMs)
+            ? inWin[0].v
+            : inWin[inWin.length - 1].v;
+        }
+        return null;
+      };
+
+      const days = [];
+      for (let off = -29; off <= 0; off++) {
+        const dateStr = this._shiftDateStr(todayDateStr, off);
+        if (!dateStr) continue;
+        const parsedMidnight = Date.parse(`${dateStr}T00:00:00Z`);
+        if (!Number.isFinite(parsedMidnight)) continue;
+        const dayStartMs = parsedMidnight - utcOffset * 1000;
+        const fullEndMs = dayStartMs + 86400000;
+        const dayEndMs =
+          off === 0 ? Math.min(fullEndMs, Math.max(dayStartMs + 60000, nowMs)) : fullEndMs;
+
+        const hasSamplesInDay = pts.some(
+          (p) => p.t >= dayStartMs - 3600000 && p.t <= dayEndMs + 3600000
+        );
+        const startSoc = hasSamplesInDay ? evalSocAt(dayStartMs, dayStartMs, dayEndMs) : null;
+        const endSoc = hasSamplesInDay ? evalSocAt(dayEndMs, dayStartMs, dayEndMs) : null;
+
+        let hasData = Number.isFinite(startSoc) && Number.isFinite(endSoc);
+        let deltaPct = 0;
+        let deltaKwh = 0;
+        if (hasData) {
+          const rawPct = endSoc - startSoc;
+          deltaPct = Math.abs(rawPct) < 0.05 ? 0 : Math.round(rawPct * 10) / 10;
+          const rawKwh = (rawPct / 100) * capKwh;
+          deltaKwh = Math.abs(rawKwh) < 0.05 ? 0 : Math.round(rawKwh * 10) / 10;
+        }
+
+        const parsedDate = Date.parse(`${dateStr}T12:00:00Z`);
+        const wdIdx = Number.isFinite(parsedDate) ? new Date(parsedDate).getUTCDay() : 0;
+        const ddMm = `${dateStr.slice(8, 10)}.${dateStr.slice(5, 7)}.`;
+        const dayShortLabel =
+          off === 0 ? 'Heute' : off === -1 ? 'Gestern' : weekdayShortNames[wdIdx] || ddMm;
+
+        days.push({
+          offset: off,
+          dateStr,
+          dayNum: dateStr.slice(8, 10),
+          dateShort: ddMm,
+          dayShortLabel,
+          hasData,
+          startSocPct: hasData ? Math.round(startSoc) : null,
+          endSocPct: hasData ? Math.round(endSoc) : null,
+          deltaPct,
+          deltaKwh,
+        });
+      }
+
+      return days;
+    }
+
+    _computeMultiDayBatteryForecast({
+      todayDateStr,
+      curTimeIso,
+      times,
+      arrays,
+      geoMap,
+      weatherMap,
+      liveMet,
+      utcOffset,
+      hSun,
+      hDay,
+      hasPvSystem,
+      batteryCfg,
+      liveSocPct,
+      windowStartOffset = 0,
+      daysCount = 6,
+    }) {
+      if (!todayDateStr || !batteryCfg?.enabled || batteryCfg.capacity_kwh <= 0) return [];
+      const weekdayShortNames = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
+      const curPrefix = String(curTimeIso || '').slice(0, 13);
+
+      const capKwh = Number(batteryCfg.capacity_kwh) || 10;
+      const minSoc = Number(batteryCfg.min_soc_pct) || 0;
+      const maxSoc = Number(batteryCfg.max_soc_pct) || 100;
+      const usableCapKwh = Math.max(0.1, capKwh * ((Math.max(minSoc, maxSoc) - minSoc) / 100));
+      const maxKwh = capKwh * (maxSoc / 100);
+      const maxChgW = Math.max(200, (Number(batteryCfg.max_charge_kw) || 5) * 1000);
+      const rtEff = Math.min(0.99, Math.max(0.65, (Number(batteryCfg.efficiency_pct) || 92) / 100));
+      const etaChg = Math.sqrt(rtEff);
+
+      const buildDaySlots = (dateStr) => {
+        const daySlots = [];
+        for (let i = 0; i < times.length; i++) {
+          if (String(times[i]).slice(0, 10) !== dateStr) continue;
+          const res = this._resolveHourlyWeather(i, arrays, geoMap, utcOffset, hSun, weatherMap, liveMet);
+          const est = hasPvSystem
+            ? this._computeHourlyPvEstimate(
+                times[i],
+                utcOffset,
+                res.rad,
+                res.dni,
+                res.dhi,
+                res.tempC,
+                res.windMs
+              )
+            : { totalWatts: res.rad };
+          daySlots.push({
+            iso: String(times[i]),
+            hh: String(times[i]).slice(11, 16),
+            isDay: Number(hDay[i] ?? 0) === 1,
+            forecastVal: Math.max(0, Number(hasPvSystem ? est.totalWatts : res.rad) || 0),
+            actualVal: null,
+            sunSec: res.sunSec,
+          });
+        }
+        return daySlots;
+      };
+
+      const maxNeededOffset = windowStartOffset + daysCount - 1;
+      const allDays = [];
+
+      for (let d = 0; d <= maxNeededOffset; d++) {
+        const dateStr = this._shiftDateStr(todayDateStr, d);
+        if (!dateStr) continue;
+        const daySlots = buildDaySlots(dateStr);
+        if (daySlots.length < 12) continue;
+
+        if (d === 0 && this._getConfiguredActualEntities().length > 0) {
+          const actualStats = this._computeActualStats(daySlots, utcOffset, todayDateStr, todayDateStr);
+          if (actualStats) {
+            daySlots.forEach((s) => {
+              const hit = actualStats.hourlyMap.get(s.iso.slice(0, 13));
+              s.actualVal = hit ? hit.avgWatts : null;
+            });
+          }
+        }
+
+        let pastChargedKwh = 0;
+        let futureChargedKwh = 0;
+
+        for (const s of daySlots) {
+          const hk = s.iso.slice(0, 13);
+          const isPastToday = d === 0 && curPrefix && hk < curPrefix;
+          const effPvW =
+            isPastToday && s.actualVal !== null && s.actualVal !== undefined
+              ? Math.max(0, s.actualVal)
+              : Math.max(0, s.forecastVal);
+          const chgKwh = (Math.min(effPvW, maxChgW) / 1000) * etaChg;
+          if (isPastToday) {
+            pastChargedKwh += chgKwh;
+          } else {
+            futureChargedKwh += chgKwh;
+          }
+        }
+
+        if (d === 0 && Number.isFinite(liveSocPct)) {
+          const curKwh = capKwh * (Math.min(maxSoc, Math.max(minSoc, liveSocPct)) / 100);
+          const remainingHeadroom = Math.max(0, maxKwh - curKwh);
+          futureChargedKwh = Math.min(futureChargedKwh, remainingHeadroom);
+        }
+
+        const chargedKwh = Math.round(Math.min(usableCapKwh, pastChargedKwh + futureChargedKwh) * 10) / 10;
+
+        const parsedDate = Date.parse(`${dateStr}T12:00:00Z`);
+        const wdIdx = Number.isFinite(parsedDate) ? new Date(parsedDate).getUTCDay() : 0;
+        const ddMm = `${dateStr.slice(8, 10)}.${dateStr.slice(5, 7)}.`;
+        const dayShortLabel =
+          d === 0 ? 'Heute' : d === 1 ? 'Morgen' : weekdayShortNames[wdIdx] || ddMm;
+
+        allDays.push({
+          offset: d,
+          dateStr,
+          dayShortLabel,
+          dateShort: ddMm,
+          chargedKwh,
+        });
+      }
+
+      return allDays.filter((d) => d.offset >= windowStartOffset).slice(0, daysCount);
     }
 
     _isoHourToUtcMs(isoHour, utcOffsetSec) {
@@ -5094,7 +7397,6 @@
       for (const slot of slots) {
         const hCenter = this._isoHourToUtcMs(slot.iso, utcOffsetSec);
         if (!Number.isFinite(hCenter)) continue;
-        if (isTargetToday && hCenter > nowMs) continue;
         const wStart = hCenter - 1800000;
         if (wStart >= maxSlotEndMs) continue;
         const wEnd = Math.min(hCenter + 1800000, maxSlotEndMs);
@@ -5108,22 +7410,11 @@
         }
       }
 
-      let nowWatts = livePowerWatts;
-      if (isTargetToday && nowWatts === null && Number.isFinite(dayStartMs) && nowMs > dayStartMs) {
-        const recentStart = Math.max(dayStartMs, nowMs - 1800000);
-        const recentRes =
-          unitType === 'power'
-            ? integratePowerWindow(recentStart, nowMs)
-            : computeEnergyWindow(recentStart, nowMs);
-        if (recentRes) nowWatts = recentRes.avgWatts;
-      }
-
       return {
         entityId,
         friendlyName: hist?.friendlyName || String(attrs.friendly_name || entityId),
         unitType,
         livePowerWatts,
-        nowWatts,
         totalTodayWh,
         hourlyMap,
         hasData: hourlyMap.size > 0 || (isTargetToday && livePowerWatts !== null),
@@ -5202,18 +7493,12 @@
 
       let liveSum = 0;
       let hasLive = false;
-      let nowSum = 0;
-      let hasNow = false;
       let totalTodayWh = 0;
       for (const st of list) {
         totalTodayWh += st.totalTodayWh || 0;
         if (st.livePowerWatts !== null && st.livePowerWatts !== undefined) {
           liveSum += st.livePowerWatts;
           hasLive = true;
-        }
-        if (st.nowWatts !== null && st.nowWatts !== undefined) {
-          nowSum += st.nowWatts;
-          hasNow = true;
         }
       }
 
@@ -5222,7 +7507,6 @@
         friendlyName: `Summe (${list.length} Strings)`,
         unitType: 'mixed',
         livePowerWatts: hasLive ? Math.round(liveSum) : null,
-        nowWatts: hasNow ? Math.round(nowSum) : null,
         totalTodayWh,
         hourlyMap,
         hasData: hourlyMap.size > 0 || hasLive,
@@ -5458,6 +7742,429 @@
           });
       });
 
+      // Batteriespeicher-Simulation für den ausgewählten Tag
+      const batteryCfg = this._config.battery_system;
+      const batteryEnabled = Boolean(
+        batteryCfg &&
+          batteryCfg.enabled &&
+          batteryCfg.capacity_kwh > 0 &&
+          this._config.show_battery_panel !== false
+      );
+      const battStripEl = this.shadowRoot?.getElementById('pv-batt-strip');
+      const socToggleBtn = this.shadowRoot?.getElementById('btn-toggle-soc');
+      if (socToggleBtn) {
+        socToggleBtn.hidden = true;
+      }
+
+      let batterySim = null;
+      let liveSocPct = null;
+      let multiDayForecast = [];
+      if (batteryEnabled) {
+        const socEntity = batteryCfg.soc_entity;
+        const loadEntity = batteryCfg.load_entity;
+        const isToday = dayOffset === 0;
+        const isPastOrToday = dayOffset <= 0;
+
+        if (dayOffset >= 0 && socEntity && this._hass?.states?.[socEntity]) {
+          const parsedSoc = parseFloat(this._hass.states[socEntity].state);
+          if (Number.isFinite(parsedSoc)) {
+            liveSocPct = Math.min(100, Math.max(0, parsedSoc));
+          }
+        }
+
+        const buildHourlyAvgMap = (entityId) => {
+          if (!entityId || !isPastOrToday) return null;
+          let hist = isToday
+            ? this._pvEntityHistories.get(entityId)
+            : this._pvPastHistories.get(`${entityId}::${targetDateStr}`);
+          let pts = hist?.points || [];
+          if (!pts.length && !isToday && entityId === socEntity && this._pvBatt30dHistory?.entityId === socEntity) {
+            pts = this._pvBatt30dHistory.points || [];
+          }
+          const out = new Map();
+          if (!pts.length) return out;
+          for (const s of resolvedSlots) {
+            const hCenter = this._isoHourToUtcMs(s.iso, utcOffset);
+            if (!Number.isFinite(hCenter)) continue;
+            const wStart = hCenter - 1800000;
+            const wEnd = hCenter + 1800000;
+            let sum = 0;
+            let cnt = 0;
+            for (const pt of pts) {
+              if (pt.t >= wStart && pt.t <= wEnd) {
+                sum += pt.v;
+                cnt++;
+              }
+            }
+            if (cnt > 0) {
+              out.set(s.iso.slice(0, 13), Math.round((sum / cnt) * 10) / 10);
+            }
+          }
+          return out;
+        };
+
+        const actualSocMap = buildHourlyAvgMap(socEntity);
+        const actualLoadMap = buildHourlyAvgMap(loadEntity);
+
+        const startSocForDay =
+          actualSocMap && actualSocMap.size > 0
+            ? Array.from(actualSocMap.values())[0]
+            : batteryCfg.initial_soc_pct;
+
+        if (isPastOrToday) {
+          batterySim = simulateBatteryDayTrajectory({
+            slots: resolvedSlots,
+            batteryCfg,
+            startSocPct: startSocForDay,
+            currentIsoPrefix: String(curTimeIso || '').slice(0, 13),
+            isToday,
+            liveSocPct: isToday ? liveSocPct : null,
+            actualSocMap,
+            actualLoadMap,
+            forecastLoadHourlyW: null,
+          });
+
+          if (batterySim && batterySim.perSlot.length === resolvedSlots.length) {
+            resolvedSlots.forEach((s, idx) => {
+              s.batt = batterySim.perSlot[idx];
+            });
+          }
+        }
+
+        multiDayForecast = this._computeMultiDayBatteryForecast({
+          todayDateStr,
+          curTimeIso,
+          times,
+          arrays,
+          geoMap,
+          weatherMap,
+          liveMet,
+          utcOffset,
+          hSun,
+          hDay,
+          hasPvSystem,
+          batteryCfg,
+          liveSocPct,
+          windowStartOffset: dayOffset > 5 ? 1 : 0,
+          daysCount: 6,
+        });
+      }
+
+      if (battStripEl) {
+        if (batteryEnabled && (batterySim || multiDayForecast.length > 0)) {
+          const liveBadge =
+            dayOffset === 0 && Number.isFinite(liveSocPct)
+              ? ` · Ist-SoC: <strong>${Math.round(liveSocPct)}%</strong>`
+              : '';
+
+          let livePowerW = null;
+          if (dayOffset === 0 && batteryCfg.power_entity && this._hass?.states?.[batteryCfg.power_entity]) {
+            const pParsed = parseFloat(this._hass.states[batteryCfg.power_entity].state);
+            if (Number.isFinite(pParsed)) {
+              const pUnit = String(
+                this._hass.states[batteryCfg.power_entity]?.attributes?.unit_of_measurement || ''
+              ).toLowerCase();
+              livePowerW = pUnit === 'kw' ? pParsed * 1000 : pParsed;
+            }
+          } else if (dayOffset === 0 && curTimeIso) {
+            const curPrefix = String(curTimeIso).slice(0, 13);
+            const curSlotHit = resolvedSlots.find((s) => s.iso.slice(0, 13) === curPrefix);
+            if (curSlotHit?.batt && Number.isFinite(curSlotHit.batt.battPowerW)) {
+              livePowerW = curSlotHit.batt.battPowerW;
+            }
+          }
+
+          const pastRawFromDay =
+            dayOffset < 0 && batteryCfg.soc_entity
+              ? this._pvPastHistories.get(`${batteryCfg.soc_entity}::${targetDateStr}`)?.points || null
+              : dayOffset === 0 && batteryCfg.soc_entity
+              ? this._pvEntityHistories.get(batteryCfg.soc_entity)?.points || null
+              : null;
+          const pastRawFallback30 =
+            dayOffset < 0 &&
+            (!pastRawFromDay || pastRawFromDay.length < 2) &&
+            batteryCfg.soc_entity &&
+            this._pvBatt30dHistory?.entityId === batteryCfg.soc_entity
+              ? this._pvBatt30dHistory.points || null
+              : null;
+
+          const dualBatteryHtml = batterySim
+            ? buildDualBatteryGraphicHtml({
+                resolvedSlots,
+                batterySim,
+                batteryCfg,
+                liveSocPct,
+                livePowerW,
+                dayOffset,
+                targetDateStr,
+                utcOffsetSec: utcOffset,
+                pastSocRawPoints:
+                  pastRawFromDay && pastRawFromDay.length >= 2
+                    ? pastRawFromDay
+                    : pastRawFallback30 || pastRawFromDay,
+                escapeHtml: (v) => this._escapeHtml(v),
+              })
+            : '';
+
+          const maxScaleKwh = Math.max(
+            3,
+            ...multiDayForecast.map((d) => d.chargedKwh)
+          );
+          const total6dKwh = multiDayForecast.reduce((acc, d) => acc + d.chargedKwh, 0);
+          const avg6dKwh = multiDayForecast.length ? total6dKwh / multiDayForecast.length : 0;
+
+          const forecastListHtml =
+            multiDayForecast.length > 0
+              ? `
+                <div class="pv-batt-forecast-wrap">
+                  <div class="pv-batt-forecast-head">
+                    <span class="pv-batt-forecast-title">6-Tage Lade-Prognose (kWh)</span>
+                    <span class="pv-batt-forecast-summary">Gesamt <strong>+${total6dKwh.toFixed(1)} kWh</strong> · Ø +${avg6dKwh.toFixed(1)} kWh/Tag</span>
+                  </div>
+                  <div class="pv-batt-forecast-grid">
+                    ${multiDayForecast
+                      .map((d) => {
+                        const fillPct =
+                          d.chargedKwh > 0.05
+                            ? Math.min(100, Math.max(5, Math.round((d.chargedKwh / maxScaleKwh) * 100)))
+                            : 0;
+                        const isSelected = d.offset === dayOffset;
+                        return `
+                          <button
+                            type="button"
+                            class="pv-batt-day-cell ${isSelected ? 'is-selected' : ''}"
+                            data-day-offset="${d.offset}"
+                            title="${this._escapeHtml(d.dayShortLabel)} (${this._escapeHtml(d.dateShort)}): voraussichtlich +${d.chargedKwh.toFixed(1)} kWh geladen"
+                          >
+                            <span class="pv-batt-day-kwh">+${d.chargedKwh.toFixed(1)} kWh</span>
+                            <div class="pv-batt-day-track">
+                              <div class="pv-batt-day-fill" style="height:${fillPct}%"></div>
+                            </div>
+                            <span class="pv-batt-day-foot">
+                              <span class="pv-batt-day-name">${this._escapeHtml(d.dayShortLabel)}</span>
+                              <span class="pv-batt-day-date">${this._escapeHtml(d.dateShort)}</span>
+                            </span>
+                          </button>
+                        `;
+                      })
+                      .join('')}
+                  </div>
+                </div>
+              `
+              : '';
+
+          const balance30Days = this._compute30DayBatteryBalance({
+            todayDateStr,
+            utcOffset,
+            batteryCfg,
+            liveSocPct,
+          });
+          const valid30Days = balance30Days.filter((d) => d.hasData);
+          const total30KwhRaw = valid30Days.reduce((acc, d) => acc + d.deltaKwh, 0);
+          const total30Kwh = Math.abs(total30KwhRaw) < 0.05 ? 0 : Math.round(total30KwhRaw * 10) / 10;
+          const posDaysCount = valid30Days.filter((d) => d.deltaKwh > 0).length;
+          const negDaysCount = valid30Days.filter((d) => d.deltaKwh < 0).length;
+          const maxAbs30Kwh = Math.max(
+            2,
+            Math.ceil(Math.max(0, ...valid30Days.map((d) => Math.abs(d.deltaKwh))))
+          );
+
+          const formatReadoutHtml = (d) => {
+            if (!d) return '';
+            if (!d.hasData) {
+              return `<span>${this._escapeHtml(d.dayShortLabel)} (${this._escapeHtml(d.dateShort)}): Keine SoC-Historie</span>`;
+            }
+            const sign = d.deltaKwh > 0 ? '+' : '';
+            const pctSign = d.deltaPct > 0 ? '+' : '';
+            const cls =
+              d.deltaKwh > 0
+                ? 'pv-batt-30d-summary-pos'
+                : d.deltaKwh < 0
+                ? 'pv-batt-30d-summary-neg'
+                : '';
+            const endLbl = d.offset === 0 ? 'Jetzt' : '24:00';
+            return `<span>${this._escapeHtml(d.dayShortLabel)} (${this._escapeHtml(d.dateShort)}) · <strong class="${cls}">${sign}${d.deltaKwh.toFixed(1)} kWh (${pctSign}${d.deltaPct.toFixed(0)}%)</strong></span><span>00:00 ${d.startSocPct}% → ${endLbl} ${d.endSocPct}%</span>`;
+          };
+
+          const active30Day =
+            balance30Days.find((d) => d.offset === dayOffset) ||
+            balance30Days[balance30Days.length - 1] ||
+            null;
+          const defaultReadoutHtml = formatReadoutHtml(active30Day);
+          const sumSign30 = total30Kwh > 0 ? '+' : '';
+          const sumCls30 =
+            total30Kwh > 0
+              ? 'pv-batt-30d-summary-pos'
+              : total30Kwh < 0
+              ? 'pv-batt-30d-summary-neg'
+              : '';
+
+          const balance30Html = !batteryCfg.soc_entity
+            ? `
+                <div class="pv-batt-30d-wrap">
+                  <div class="pv-batt-forecast-head">
+                    <span class="pv-batt-forecast-title">30-Tage Tagesbilanz (kWh)</span>
+                  </div>
+                  <div class="pv-batt-30d-empty">Für die 30-Tage Tagesbilanz bitte einen <code>soc_entity</code> Sensor konfigurieren.</div>
+                </div>
+              `
+            : balance30Days.length > 0
+            ? `
+                <div class="pv-batt-30d-wrap">
+                  <div class="pv-batt-forecast-head">
+                    <span class="pv-batt-forecast-title">30-Tage Tagesbilanz (kWh)</span>
+                    <span class="pv-batt-forecast-summary">${
+                      valid30Days.length > 0
+                        ? `Gesamt <strong class="${sumCls30}">${sumSign30}${total30Kwh.toFixed(1)} kWh</strong> · ${posDaysCount}+ / ${negDaysCount}− Tage`
+                        : 'SoC-Verlauf wird geladen…'
+                    }</span>
+                  </div>
+                  <div class="pv-batt-30d-chart">
+                    <div class="pv-batt-30d-yaxis">
+                      <span class="pv-batt-30d-y-pos">+${maxAbs30Kwh}</span>
+                      <span class="pv-batt-30d-y-zero">0</span>
+                      <span class="pv-batt-30d-y-neg">-${maxAbs30Kwh}</span>
+                    </div>
+                    <div class="pv-batt-30d-scroll" id="pv-batt-30d-scroll">
+                      <div class="pv-batt-30d-body">
+                        <div class="pv-batt-30d-plot">
+                          <div class="pv-batt-30d-guide-top"></div>
+                          <div class="pv-batt-30d-zero-line"></div>
+                          <div class="pv-batt-30d-guide-bot"></div>
+                          ${balance30Days
+                            .map((d) => {
+                              const isSelected = d.offset === dayOffset;
+                              const barPct =
+                                d.hasData && Math.abs(d.deltaKwh) > 0
+                                  ? Math.min(100, Math.max(7, Math.round((Math.abs(d.deltaKwh) / maxAbs30Kwh) * 100)))
+                                  : 0;
+                              const readoutStr = formatReadoutHtml(d);
+                              const tip = d.hasData
+                                ? `${d.dayShortLabel} (${d.dateShort}): ${d.deltaKwh > 0 ? '+' : ''}${d.deltaKwh.toFixed(1)} kWh (${d.deltaPct > 0 ? '+' : ''}${d.deltaPct.toFixed(1)}%) · 00:00 ${d.startSocPct}% → ${d.offset === 0 ? 'Jetzt' : '24:00'} ${d.endSocPct}%`
+                                : `${d.dayShortLabel} (${d.dateShort}): Keine SoC-Daten`;
+                              return `
+                                <button
+                                  type="button"
+                                  class="pv-batt-30d-col ${isSelected ? 'is-selected' : ''}"
+                                  data-day-offset="${d.offset}"
+                                  data-readout="${this._escapeHtml(readoutStr)}"
+                                  title="${this._escapeHtml(tip)}"
+                                  aria-label="${this._escapeHtml(tip)}"
+                                >
+                                  ${
+                                    d.hasData && d.deltaKwh > 0
+                                      ? `<div class="pv-batt-30d-half-pos"><div class="pv-batt-30d-bar pos" style="height:${barPct}%"></div></div>`
+                                      : ''
+                                  }
+                                  ${
+                                    d.hasData && d.deltaKwh < 0
+                                      ? `<div class="pv-batt-30d-half-neg"><div class="pv-batt-30d-bar neg" style="height:${barPct}%"></div></div>`
+                                      : ''
+                                  }
+                                  ${
+                                    d.hasData && d.deltaKwh === 0
+                                      ? `<span class="pv-batt-30d-zero-dot"></span>`
+                                      : !d.hasData
+                                      ? `<span class="pv-batt-30d-nodata"></span>`
+                                      : ''
+                                  }
+                                </button>
+                              `;
+                            })
+                            .join('')}
+                        </div>
+                        <div class="pv-batt-30d-xaxis">
+                          ${balance30Days
+                            .map((d, idx) => {
+                              const isSelected = d.offset === dayOffset;
+                              const showTick =
+                                idx === 0 || idx === 29 || idx % 5 === 0 || isSelected;
+                              const lbl =
+                                d.offset === 0
+                                  ? 'Heute'
+                                  : showTick
+                                  ? d.dateShort.slice(0, 5)
+                                  : '';
+                              return `<span class="pv-batt-30d-tick ${isSelected ? 'is-selected' : ''}">${this._escapeHtml(lbl)}</span>`;
+                            })
+                            .join('')}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="pv-batt-30d-readout" id="pv-batt-30d-readout" data-default-readout="${this._escapeHtml(defaultReadoutHtml)}">
+                    ${defaultReadoutHtml}
+                  </div>
+                </div>
+              `
+            : '';
+
+          battStripEl.style.display = '';
+          battStripEl.classList.add('is-visible');
+          battStripEl.innerHTML = `
+            <div class="pv-batt-main-card">
+              <div class="pv-batt-head">
+                <div class="pv-range-switch" role="group" aria-label="Tag wählen">
+                  <button type="button" class="pv-range-btn pv-day-nav" data-batt-day-nav="prev" data-day-switch-prev title="Einen Tag zurück" aria-label="Vorheriger Tag">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+                  </button>
+                  <button type="button" class="pv-range-btn pv-day-current active" data-batt-day-nav="today" data-day-switch-label title="Heute">Heute</button>
+                  <button type="button" class="pv-range-btn pv-day-nav" data-batt-day-nav="next" data-day-switch-next title="Einen Tag vor" aria-label="Nächster Tag">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+                  </button>
+                </div>
+                <span class="pv-batt-title">Batteriespeicher (${batteryCfg.capacity_kwh.toFixed(1)} kWh)${liveBadge}</span>
+              </div>
+              ${dualBatteryHtml}
+              ${forecastListHtml}
+            </div>
+            ${balance30Html}
+          `;
+          this._updatePvDayButtonsUI();
+          if (this._pv30dResizeObserver) {
+            this._pv30dResizeObserver.disconnect();
+            this._pv30dResizeObserver = null;
+          }
+          const scroll30dEl = battStripEl.querySelector('#pv-batt-30d-scroll');
+          if (scroll30dEl) {
+            const syncScrollRight = () => {
+              const maxScroll = Math.max(0, scroll30dEl.scrollWidth - scroll30dEl.clientWidth);
+              const fromRight = Number.isFinite(this._pv30dScrollFromRight)
+                ? this._pv30dScrollFromRight
+                : 0;
+              scroll30dEl.scrollLeft = Math.max(0, maxScroll - fromRight);
+            };
+            syncScrollRight();
+            requestAnimationFrame(() => {
+              syncScrollRight();
+              scroll30dEl.dataset.scrollReady = '1';
+            });
+            scroll30dEl.addEventListener(
+              'scroll',
+              () => {
+                if (scroll30dEl.dataset.scrollReady !== '1') return;
+                const maxScroll = Math.max(0, scroll30dEl.scrollWidth - scroll30dEl.clientWidth);
+                this._pv30dScrollFromRight = Math.max(0, maxScroll - scroll30dEl.scrollLeft);
+              },
+              { passive: true }
+            );
+            if (typeof ResizeObserver !== 'undefined') {
+              this._pv30dResizeObserver = new ResizeObserver(() => {
+                if ((this._pv30dScrollFromRight ?? 0) <= 8) {
+                  this._pv30dScrollFromRight = 0;
+                  syncScrollRight();
+                }
+              });
+              this._pv30dResizeObserver.observe(scroll30dEl);
+            }
+          }
+        } else {
+          battStripEl.classList.remove('is-visible');
+          battStripEl.style.display = '';
+          battStripEl.innerHTML = '';
+        }
+      }
+
       let visibleSlots = resolvedSlots;
       if (this._config.hide_night && resolvedSlots.length > 4) {
         const activeIndices = [];
@@ -5485,37 +8192,27 @@
         return [];
       }
 
+      const showSocOverlay = false;
       const svgW = 720;
       const svgH = 186;
       const padL = 46;
-      const padR = 16;
+      const padR = showSocOverlay ? 36 : 16;
       const padT = 18;
       const padB = 24;
       const plotW = svgW - padL - padR;
       const plotH = svgH - padT - padB;
       const baseY = padT + plotH;
 
-      const nowMs = Date.now();
-      const nowActualWatts =
-        dayOffset === 0 &&
-        actualStats &&
-        actualStats.nowWatts !== null &&
-        actualStats.nowWatts !== undefined
-          ? actualStats.nowWatts
-          : null;
-
       let rawMax = hasPvSystem ? Math.max(400, pvTotalWp * 0.22) : 200;
       for (const s of visibleSlots) {
         rawMax = Math.max(rawMax, s.forecastVal, s.idealVal || 0, s.actualVal || 0);
-      }
-      if (nowActualWatts !== null) {
-        rawMax = Math.max(rawMax, nowActualWatts);
       }
       const yMax = this._niceMaxWatts(rawMax * 1.12);
 
       const n = visibleSlots.length;
       const mapX = (i) => (n === 1 ? padL + plotW / 2 : padL + (i / (n - 1)) * plotW);
       const mapY = (v) => baseY - (Math.min(yMax, Math.max(0, v)) / yMax) * plotH;
+      const mapSocY = (pct) => baseY - (Math.min(100, Math.max(0, pct)) / 100) * plotH;
 
       const chartSlots = visibleSlots.map((s, i) => ({
         ...s,
@@ -5523,6 +8220,11 @@
         yIdeal: mapY(s.idealVal),
         yForecast: mapY(s.forecastVal),
         yActual: s.actualVal !== null ? mapY(s.actualVal) : null,
+        ySoc: showSocOverlay && s.batt ? mapSocY(s.batt.socForecastPct) : null,
+        ySocActual:
+          showSocOverlay && s.batt && s.batt.socActualPct !== null && s.batt.socActualPct !== undefined
+            ? mapSocY(s.batt.socActualPct)
+            : null,
         fullTimeLabel: `${dayLabel} ${s.hh}`,
       }));
 
@@ -5532,7 +8234,23 @@
       const forecastPts = chartSlots.map((s) => ({ x: s.x, y: s.yForecast }));
       const forecastPath = this._buildMonotonePath(forecastPts, baseY);
 
+      const actualPts = chartSlots
+        .filter((s) => s.yActual !== null)
+        .map((s) => ({ x: s.x, y: s.yActual }));
+      const actualPath = actualPts.length > 0 ? this._buildMonotonePath(actualPts, baseY) : null;
+
+      const socPts = showSocOverlay
+        ? chartSlots.filter((s) => s.ySoc !== null).map((s) => ({ x: s.x, y: s.ySoc }))
+        : [];
+      const socPath = socPts.length > 0 ? this._buildMonotonePath(socPts, null) : null;
+
+      const socActualPts = showSocOverlay
+        ? chartSlots.filter((s) => s.ySocActual !== null).map((s) => ({ x: s.x, y: s.ySocActual }))
+        : [];
+      const socActualPath = socActualPts.length > 0 ? this._buildMonotonePath(socActualPts, null) : null;
+
       // Aktuelle Zeitposition ("Jetzt"-Linie nur bei Heute)
+      const nowMs = Date.now();
       let nowX = null;
       if (dayOffset === 0) {
         const firstMs = this._isoHourToUtcMs(chartSlots[0].iso, utcOffset);
@@ -5556,21 +8274,6 @@
         }
       }
 
-      const actualPts = chartSlots
-        .filter((s) => s.yActual !== null && (nowX === null || s.x <= nowX + 0.5))
-        .map((s) => ({ x: s.x, y: s.yActual }));
-      if (dayOffset === 0 && nowX !== null && nowActualWatts !== null) {
-        const yNow = mapY(nowActualWatts);
-        const lastPt = actualPts.length > 0 ? actualPts[actualPts.length - 1] : null;
-        if (!lastPt || nowX > lastPt.x + 1.0) {
-          actualPts.push({ x: nowX, y: yNow });
-        } else if (Math.abs(nowX - lastPt.x) <= 1.0) {
-          lastPt.x = nowX;
-          lastPt.y = yNow;
-        }
-      }
-      const actualPath = actualPts.length > 0 ? this._buildMonotonePath(actualPts, baseY) : null;
-
       // Y-Achsen-Rasterlinien
       const formatYTick = (val) => {
         if (val === 0) return '0';
@@ -5592,6 +8295,18 @@
           );
         })
         .join('');
+
+      const socRightAxisHtml = showSocOverlay
+        ? [0, 50, 100]
+            .map((pct) => {
+              const y = mapSocY(pct);
+              return `<text x="${svgW - padR + 6}" y="${(y + 3.5).toFixed(1)}" text-anchor="start" fill="#c084fc" fill-opacity="0.78" font-size="9.5" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">${pct}%</text>`;
+            })
+            .join('') +
+          `<line x1="${padL}" y1="${mapSocY(batteryCfg.min_soc_pct).toFixed(1)}" x2="${svgW - padR}" y2="${mapSocY(
+            batteryCfg.min_soc_pct
+          ).toFixed(1)}" stroke="rgba(192,132,252,0.22)" stroke-dasharray="2 3" />`
+        : '';
 
       // X-Achsen-Ticks
       const labelStep = n > 16 ? 3 : n > 9 ? 2 : 1;
@@ -5630,6 +8345,14 @@
           ].y.toFixed(1)}" r="3.6" fill="#fbbf24" stroke="#090c12" stroke-width="1.5" />`
         : '';
 
+      const socSeriesHtml =
+        showSocOverlay && socPath
+          ? `<path d="${socPath.line}" fill="none" stroke="#c084fc" stroke-width="2.0" stroke-linecap="round" stroke-linejoin="round" />` +
+            (socActualPath && socActualPts.length > 1
+              ? `<path d="${socActualPath.line}" fill="none" stroke="#f472b6" stroke-width="1.8" stroke-dasharray="3 2" stroke-linecap="round" stroke-linejoin="round" />`
+              : '')
+          : '';
+
       svgEl.innerHTML = `
         <defs>
           <linearGradient id="pvIdealGrad" x1="0" y1="0" x2="0" y2="1">
@@ -5646,6 +8369,7 @@
           </linearGradient>
         </defs>
         ${yGridHtml}
+        ${socRightAxisHtml}
         ${xTicksHtml}
         <path d="${idealPath.area}" fill="url(#pvIdealGrad)" />
         <path d="${idealPath.line}" fill="none" stroke="#34d399" stroke-opacity="0.72" stroke-width="1.6" stroke-dasharray="4 3" stroke-linecap="round" stroke-linejoin="round" />
@@ -5654,11 +8378,13 @@
           hasActualLine ? '2.1' : '2.3'
         }" stroke-linecap="round" stroke-linejoin="round" />
         ${actualSeriesHtml}
+        ${socSeriesHtml}
         ${nowLineHtml}
         <line id="pv-chart-crosshair" x1="0" y1="${padT}" x2="0" y2="${baseY}" stroke="rgba(255,255,255,0.38)" stroke-width="1" opacity="0" />
         <circle id="pv-chart-dot-ideal" cx="0" cy="0" r="3.4" fill="#34d399" stroke="#090c12" stroke-width="1.5" opacity="0" />
         <circle id="pv-chart-dot-forecast" cx="0" cy="0" r="4" fill="#38bdf8" stroke="#090c12" stroke-width="1.5" opacity="0" />
         <circle id="pv-chart-dot-actual" cx="0" cy="0" r="4.2" fill="#fbbf24" stroke="#090c12" stroke-width="1.5" opacity="0" />
+        <circle id="pv-chart-dot-soc" cx="0" cy="0" r="4" fill="#c084fc" stroke="#090c12" stroke-width="1.5" opacity="0" />
       `;
 
       // Header Legend & Summen aktualisieren
@@ -5676,6 +8402,12 @@
         legendHtml += `<span class="pv-legend-item"><span class="pv-legend-dot actual"></span>Ist: ${this._escapeHtml(
           actualStats?.friendlyName || this._config.pv_actual_entity || 'Strings'
         )}${liveTxt}</span>`;
+      }
+      if (showSocOverlay) {
+        legendHtml += `<span class="pv-legend-item"><span class="pv-legend-dot soc"></span>Speicher-SoC (%)</span>`;
+        if (socActualPts.length > 1) {
+          legendHtml += `<span class="pv-legend-item"><span class="pv-legend-dot soc-actual"></span>SoC Ist</span>`;
+        }
       }
       legendEl.innerHTML = legendHtml;
 
@@ -6050,10 +8782,16 @@
           pvTooltip = `PV ~${s.forecastVal} W${tipSplit} · `;
         }
 
+        const hasActualSoc =
+          s.batt && s.batt.socActualPct !== null && s.batt.socActualPct !== undefined;
+        const socLine = hasActualSoc
+          ? `<span class="pv-hour-soc">${Math.round(s.batt.socActualPct)}%</span>`
+          : '';
+
         cells.push(`
           <div class="pv-hour-cell ${isNowCell ? 'is-now' : ''}" title="${this._escapeHtml(
           s.dayLabel
-        )} ${hh} Uhr: ${pvTooltip}Sonne ${sunMin} min (${s.hasZAMG ? 'ZAMG' : 'OM'}), ${s.rad} W/m², Wolken ${cld}%, Tiefe Wolken ${low}%, Sicht ${this._formatVisibility(
+        )} ${hh} Uhr: ${pvTooltip}${hasActualSoc ? `Ist-SoC ${Math.round(s.batt.socActualPct)}% · ` : ''}Sonne ${sunMin} min (${s.hasZAMG ? 'ZAMG' : 'OM'}), ${s.rad} W/m², Wolken ${cld}%, Tiefe Wolken ${low}%, Sicht ${this._formatVisibility(
           vis,
           true
         )}">
@@ -6061,6 +8799,7 @@
             <div class="pv-bar-track">
               <div class="pv-bar-fill" style="height:${pct}%"></div>
             </div>
+            ${socLine}
             <span class="pv-hour-sun ${sunMin > 0 ? '' : 'none'}">☀${sunMin}m</span>
             <span class="pv-hour-cloud ${fogHere ? 'fog' : ''}">${fogHere ? 'Nebel' : `${cld}%`}</span>
             <span class="pv-hour-time">${hh}</span>
@@ -6069,6 +8808,8 @@
       }
 
       gridEl.innerHTML = cells.join('');
+      this._fitPvFullscreen();
+      requestAnimationFrame(() => this._fitPvFullscreen());
     }
 
     async _fetchAndBuildRadarLayers() {
@@ -6252,6 +8993,9 @@
         if (this._getConfiguredActualEntities().length > 0) {
           this._fetchPvActualHistory(true);
         }
+        if (this._config.battery_system?.enabled && this._config.battery_system?.soc_entity) {
+          this._fetchBatt30dHistory(false);
+        }
       }, REFRESH_INTERVAL_MS);
     }
 
@@ -6287,13 +9031,23 @@
       this._stringCalibStates = {};
       this._openShadePanels = new Set();
       this._stringsRenderKey = '';
+      this._entityCatalog = { pv: [], weather: [], soc: [], allSensors: [] };
+      this._activeEntityCombo = null;
+      this._justSelectedComboAt = 0;
+      this._onDocPointerDown = (e) => {
+        if (!this._activeEntityCombo) return;
+        const path = typeof e.composedPath === 'function' ? e.composedPath() : [];
+        if (!path.includes(this._activeEntityCombo.comboEl)) {
+          this._closeEntityCombo();
+        }
+      };
     }
 
     set hass(hass) {
       this._hass = hass;
       if (this._rendered) {
         this._syncCoordPlaceholders();
-        this._syncEntityDatalist();
+        this._refreshEntityCatalog();
       }
     }
 
@@ -6314,10 +9068,16 @@
     }
 
     connectedCallback() {
+      document.addEventListener('pointerdown', this._onDocPointerDown, true);
       if (!this._rendered) {
         this._render();
       }
       this._syncInputs();
+    }
+
+    disconnectedCallback() {
+      document.removeEventListener('pointerdown', this._onDocPointerDown, true);
+      this._closeEntityCombo();
     }
 
     _getBool(key, fallback) {
@@ -6476,49 +9236,291 @@
       }
     }
 
-    _syncEntityDatalist() {
-      const listEl = this.shadowRoot?.getElementById('ed-pv-entities');
-      if (listEl && this._hass?.states) {
-        const entities = Object.keys(this._hass.states)
-          .filter((id) => {
-            if (!id.startsWith('sensor.')) return false;
-            const st = this._hass.states[id];
-            const u = String(st?.attributes?.unit_of_measurement || '').toLowerCase();
-            const dc = String(st?.attributes?.device_class || '').toLowerCase();
-            return (
-              dc === 'power' ||
-              dc === 'energy' ||
-              u === 'w' ||
-              u === 'kw' ||
-              u === 'wh' ||
-              u === 'kwh'
-            );
-          })
-          .sort();
-        listEl.innerHTML = entities
-          .map((id) => {
-            const fn = this._hass.states[id]?.attributes?.friendly_name || '';
-            const escId = id.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
-            const escFn = String(fn).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
-            return `<option value="${escId}">${escFn}</option>`;
-          })
-          .join('');
+    _refreshEntityCatalog() {
+      const states = this._hass?.states;
+      if (!states || typeof states !== 'object') {
+        this._entityCatalog = { pv: [], weather: [], soc: [], allSensors: [] };
+        return;
       }
 
-      const weatherListEl = this.shadowRoot?.getElementById('ed-weather-entities');
-      if (weatherListEl && this._hass?.states) {
-        const wEntities = Object.keys(this._hass.states)
-          .filter((id) => id.startsWith('weather.'))
-          .sort();
-        weatherListEl.innerHTML = wEntities
-          .map((id) => {
-            const fn = this._hass.states[id]?.attributes?.friendly_name || '';
-            const escId = id.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
-            const escFn = String(fn).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
-            return `<option value="${escId}">${escFn}</option>`;
+      const toEntry = (id) => {
+        const st = states[id];
+        const fn = String(st?.attributes?.friendly_name || '').trim();
+        const rawState = st?.state !== undefined && st?.state !== null ? String(st.state) : '';
+        const unit = String(st?.attributes?.unit_of_measurement || '').trim();
+        const stateLabel =
+          rawState && rawState !== 'unknown' && rawState !== 'unavailable'
+            ? unit
+              ? `${rawState} ${unit}`
+              : rawState
+            : rawState || '';
+        return { id, name: fn, stateLabel };
+      };
+
+      const pv = [];
+      const weather = [];
+      const soc = [];
+      const allSensors = [];
+
+      Object.keys(states)
+        .sort()
+        .forEach((id) => {
+          const st = states[id];
+          const u = String(st?.attributes?.unit_of_measurement || '').toLowerCase();
+          const dc = String(st?.attributes?.device_class || '').toLowerCase();
+
+          if (id.startsWith('weather.')) {
+            weather.push(toEntry(id));
+            return;
+          }
+          if (!id.startsWith('sensor.')) return;
+
+          const entry = toEntry(id);
+          allSensors.push(entry);
+
+          if (
+            dc === 'power' ||
+            dc === 'energy' ||
+            u === 'w' ||
+            u === 'kw' ||
+            u === 'wh' ||
+            u === 'kwh'
+          ) {
+            pv.push(entry);
+          }
+          if (dc === 'battery' || u === '%') {
+            soc.push(entry);
+          }
+        });
+
+      this._entityCatalog = { pv, weather, soc, allSensors };
+    }
+
+    _getFilteredEntities(kind, queryText, useFilter) {
+      const primary = Array.isArray(this._entityCatalog?.[kind]) ? this._entityCatalog[kind] : [];
+      const fallbackAll =
+        kind === 'pv' || kind === 'soc'
+          ? Array.isArray(this._entityCatalog?.allSensors)
+            ? this._entityCatalog.allSensors
+            : []
+          : primary;
+
+      const q = useFilter ? String(queryText || '').trim().toLowerCase() : '';
+      if (!q) return primary.length > 0 ? primary : fallbackAll;
+
+      const matches = (item) =>
+        item.id.toLowerCase().includes(q) || item.name.toLowerCase().includes(q);
+
+      const primaryHits = primary.filter(matches);
+      if (primaryHits.length > 0) return primaryHits;
+      return fallbackAll.filter(matches);
+    }
+
+    _closeEntityCombo() {
+      const cur = this._activeEntityCombo;
+      if (!cur) return;
+      cur.menuEl.hidden = true;
+      cur.comboEl.classList.remove('open');
+      cur.toggleBtn?.setAttribute('aria-expanded', 'false');
+      this._activeEntityCombo = null;
+    }
+
+    _renderEntityComboMenu(comboState) {
+      const { menuEl, inputEl, kind, filterTyped } = comboState;
+      const items = this._getFilteredEntities(kind, inputEl.value, filterTyped);
+      comboState.items = items;
+
+      const esc = (s) =>
+        String(s ?? '')
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;');
+
+      const currentId = String(inputEl.value || '').trim();
+      if (comboState.highlightIdx >= items.length) {
+        comboState.highlightIdx = items.length > 0 ? 0 : -1;
+      }
+
+      const clearRow =
+        currentId && !filterTyped
+          ? `<button type="button" class="ed-entity-item ed-entity-clear" data-entity-id="">
+               <span class="ed-entity-main">
+                 <span class="ed-entity-name">✕ Auswahl entfernen</span>
+                 <span class="ed-entity-id">Feld leeren</span>
+               </span>
+             </button>`
+          : '';
+
+      if (items.length === 0) {
+        menuEl.innerHTML =
+          clearRow +
+          `<div class="ed-entity-empty">${
+            this._hass?.states
+              ? 'Keine passenden Sensoren gefunden – Sensor-ID direkt eintippen.'
+              : 'Sensoren werden geladen (oder ID direkt eintippen)...'
+          }</div>`;
+        return;
+      }
+
+      menuEl.innerHTML =
+        clearRow +
+        items
+          .map((item, idx) => {
+            const isSelected = item.id === currentId;
+            const isHi = idx === comboState.highlightIdx;
+            return `<button type="button" class="ed-entity-item${isSelected ? ' selected' : ''}${
+              isHi ? ' highlighted' : ''
+            }" data-entity-id="${esc(item.id)}" data-item-idx="${idx}">
+              <span class="ed-entity-main">
+                <span class="ed-entity-name">${esc(item.name || item.id)}</span>
+                <span class="ed-entity-id">${esc(item.id)}</span>
+              </span>
+              ${item.stateLabel ? `<span class="ed-entity-val">${esc(item.stateLabel)}</span>` : ''}
+            </button>`;
           })
           .join('');
+    }
+
+    _openEntityCombo(comboEl, inputEl, menuEl, toggleBtn, kind, onSelect, filterTyped = false) {
+      if (this._activeEntityCombo && this._activeEntityCombo.comboEl !== comboEl) {
+        this._closeEntityCombo();
       }
+      this._refreshEntityCatalog();
+      const currentId = String(inputEl.value || '').trim();
+      const baseItems = this._getFilteredEntities(kind, inputEl.value, filterTyped);
+      const selectedIdx = baseItems.findIndex((x) => x.id === currentId);
+      const comboState = {
+        comboEl,
+        inputEl,
+        menuEl,
+        toggleBtn,
+        kind,
+        onSelect,
+        filterTyped,
+        items: baseItems,
+        highlightIdx: selectedIdx >= 0 ? selectedIdx : baseItems.length > 0 ? 0 : -1,
+      };
+      this._activeEntityCombo = comboState;
+      this._renderEntityComboMenu(comboState);
+      menuEl.hidden = false;
+      comboEl.classList.add('open');
+      toggleBtn?.setAttribute('aria-expanded', 'true');
+      const targetEl =
+        menuEl.querySelector('.ed-entity-item.selected') ||
+        menuEl.querySelector('.ed-entity-item.highlighted');
+      if (targetEl && typeof targetEl.scrollIntoView === 'function') {
+        targetEl.scrollIntoView({ block: 'nearest' });
+      }
+    }
+
+    _bindEntityCombo(comboEl, kind, onSelect) {
+      if (!comboEl || comboEl.dataset.comboBound === '1') return;
+      comboEl.dataset.comboBound = '1';
+      const inputEl = comboEl.querySelector('input');
+      const toggleBtn = comboEl.querySelector('.ed-entity-toggle');
+      const menuEl = comboEl.querySelector('.ed-entity-menu');
+      if (!inputEl || !menuEl) return;
+
+      const selectEntity = (val) => {
+        const cleanVal = String(val || '').trim();
+        inputEl.value = cleanVal;
+        this._justSelectedComboAt = Date.now();
+        this._closeEntityCombo();
+        onSelect(cleanVal);
+      };
+
+      inputEl.addEventListener('focus', () => {
+        if (Date.now() - this._justSelectedComboAt < 180) return;
+        this._openEntityCombo(comboEl, inputEl, menuEl, toggleBtn, kind, onSelect, false);
+      });
+
+      inputEl.addEventListener('click', () => {
+        if (Date.now() - this._justSelectedComboAt < 180) return;
+        if (!this._activeEntityCombo || this._activeEntityCombo.comboEl !== comboEl) {
+          this._openEntityCombo(comboEl, inputEl, menuEl, toggleBtn, kind, onSelect, false);
+        }
+      });
+
+      inputEl.addEventListener('input', () => {
+        this._openEntityCombo(comboEl, inputEl, menuEl, toggleBtn, kind, onSelect, true);
+        onSelect(inputEl.value.trim());
+      });
+
+      inputEl.addEventListener('keydown', (e) => {
+        const cur = this._activeEntityCombo;
+        const isOpen = Boolean(cur && cur.comboEl === comboEl);
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          if (!isOpen) {
+            this._openEntityCombo(comboEl, inputEl, menuEl, toggleBtn, kind, onSelect, false);
+            return;
+          }
+          if (cur.items.length > 0) {
+            cur.highlightIdx = (cur.highlightIdx + 1) % cur.items.length;
+            this._renderEntityComboMenu(cur);
+            menuEl.querySelector('.ed-entity-item.highlighted')?.scrollIntoView({ block: 'nearest' });
+          }
+        } else if (e.key === 'ArrowUp') {
+          if (!isOpen || cur.items.length === 0) return;
+          e.preventDefault();
+          cur.highlightIdx = (cur.highlightIdx - 1 + cur.items.length) % cur.items.length;
+          this._renderEntityComboMenu(cur);
+          menuEl.querySelector('.ed-entity-item.highlighted')?.scrollIntoView({ block: 'nearest' });
+        } else if (e.key === 'Enter') {
+          if (!isOpen || cur.highlightIdx < 0 || !cur.items[cur.highlightIdx]) return;
+          e.preventDefault();
+          selectEntity(cur.items[cur.highlightIdx].id);
+        } else if (e.key === 'Escape') {
+          if (isOpen) {
+            e.preventDefault();
+            e.stopPropagation();
+            this._closeEntityCombo();
+          }
+        }
+      });
+
+      inputEl.addEventListener('blur', () => {
+        setTimeout(() => {
+          if (
+            this._activeEntityCombo &&
+            this._activeEntityCombo.comboEl === comboEl &&
+            this.shadowRoot?.activeElement !== inputEl
+          ) {
+            this._closeEntityCombo();
+          }
+        }, 180);
+      });
+
+      if (toggleBtn) {
+        toggleBtn.addEventListener('mousedown', (e) => {
+          e.preventDefault();
+        });
+        toggleBtn.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (this._activeEntityCombo && this._activeEntityCombo.comboEl === comboEl) {
+            this._closeEntityCombo();
+          } else {
+            this._openEntityCombo(comboEl, inputEl, menuEl, toggleBtn, kind, onSelect, false);
+            inputEl.focus();
+          }
+        });
+      }
+
+      menuEl.addEventListener('mousedown', (e) => {
+        if (e.target.closest('.ed-entity-item')) {
+          e.preventDefault();
+        }
+      });
+
+      menuEl.addEventListener('click', (e) => {
+        const item = e.target.closest('.ed-entity-item');
+        if (!item) return;
+        e.preventDefault();
+        e.stopPropagation();
+        selectEntity(item.getAttribute('data-entity-id') || '');
+      });
     }
 
     _syncInputs() {
@@ -6560,7 +9562,6 @@
 
       setChecked('ed-auto-play', this._getBool('auto_play', true));
       setChecked('ed-show-radar', this._getBool('show_radar', true));
-      setChecked('ed-show-pv', this._getBool('show_pv_panel', true));
       setChecked('ed-show-map', this._getBool('show_map', true));
       setChecked('ed-hide-night', this._getBool('hide_night', false));
       setChecked('ed-show-clouds', this._getBool('show_clouds', true));
@@ -6573,8 +9574,10 @@
       const stringsContainer = this.shadowRoot.getElementById('ed-strings-list');
       const focusInsideStrings = Boolean(
         stringsContainer &&
-          this.shadowRoot.activeElement &&
-          stringsContainer.contains(this.shadowRoot.activeElement)
+          ((this.shadowRoot.activeElement &&
+            stringsContainer.contains(this.shadowRoot.activeElement)) ||
+            (this._activeEntityCombo &&
+              stringsContainer.contains(this._activeEntityCombo.comboEl)))
       );
       const nextKey = this._computeStringsRenderKey(strings);
       if (!focusInsideStrings && nextKey !== this._stringsRenderKey) {
@@ -6600,38 +9603,39 @@
 
       setVal('ed-lat', hasLat ? String(this._config.latitude) : '');
       setVal('ed-lon', hasLon ? String(this._config.longitude) : '');
-      setVal('ed-actual-entity', String(this._config.pv_actual_entity || ''));
+      const actualEntityVal = String(this._config.pv_actual_entity || '').trim();
+      setVal('ed-actual-entity', actualEntityVal);
+      const actualInp = this.shadowRoot.getElementById('ed-actual-entity');
+      const actualReqState = this.shadowRoot.getElementById('ed-actual-req-state');
+      const actualHint = this.shadowRoot.getElementById('ed-actual-entity-hint');
+      const actualMissing = !actualEntityVal;
+      if (actualInp) actualInp.classList.toggle('ed-input-missing', actualMissing);
+      if (actualReqState) {
+        actualReqState.textContent = actualMissing ? 'Pflichtfeld fehlt' : 'Pflichtfeld ✓';
+        actualReqState.classList.toggle('missing', actualMissing);
+        actualReqState.classList.toggle('ok', !actualMissing);
+      }
+      if (actualHint) {
+        actualHint.textContent = actualMissing
+          ? 'Bitte einen PV-Leistungssensor (W oder kW) für die Ist-Kurve eintragen.'
+          : 'Sensor für die gemessene PV-Gesamtleistung (W oder kW) in der Ist-Kurve.';
+        actualHint.classList.toggle('missing', actualMissing);
+      }
       setVal('ed-weather-entity', String(this._config.weather_entity || ''));
 
-      const defaultCalibDate = this._getDefaultCalibDate();
-      const calibDateEl = this.shadowRoot.getElementById('ed-calib-date');
-      if (calibDateEl && !calibDateEl.value) {
-        calibDateEl.value = defaultCalibDate;
-      } else if (
-        calibDateEl &&
-        this._config.pv_shading_date &&
-        this.shadowRoot.activeElement !== calibDateEl
-      ) {
-        calibDateEl.value = String(this._config.pv_shading_date);
-      }
-
-      const globalSectors = normalizePvShadingConfig(this._config.pv_shading);
-      const globalSummaryBadge = this.shadowRoot.getElementById('ed-global-shade-badge');
-      if (globalSummaryBadge) {
-        globalSummaryBadge.textContent =
-          globalSectors.length > 0
-            ? `${globalSectors.length} ${globalSectors.length === 1 ? 'Sektor' : 'Sektoren'} aktiv`
-            : 'Inaktiv';
-      }
-      const globalDetails = this.shadowRoot.getElementById('ed-global-shading-details');
-      if (globalDetails && globalSectors.length > 0 && !this._globalDetailsUserToggled) {
-        globalDetails.open = true;
+      const batt = normalizeBatterySystemConfig(this._config.battery_system);
+      setChecked('ed-batt-enabled', batt.enabled);
+      setVal('ed-batt-cap', batt.capacity_kwh > 0 ? String(batt.capacity_kwh) : '');
+      setVal('ed-batt-soc-entity', batt.soc_entity);
+      const battBadge = this.shadowRoot.getElementById('ed-batt-badge');
+      if (battBadge) {
+        battBadge.textContent = batt.enabled
+          ? `${batt.capacity_kwh.toFixed(1)} kWh`
+          : 'Inaktiv';
       }
 
       this._syncCoordPlaceholders();
-      this._syncEntityDatalist();
-      this._renderShadingSectors();
-      this._syncCalibStatusUI();
+      this._refreshEntityCatalog();
     }
 
     _syncExistingStringCards(strings) {
@@ -6686,6 +9690,9 @@
     _renderStringCards(strings, defaultTilt) {
       const listEl = this.shadowRoot?.getElementById('ed-strings-list');
       if (!listEl) return;
+      if (this._activeEntityCombo && listEl.contains(this._activeEntityCombo.comboEl)) {
+        this._closeEntityCombo();
+      }
       this._stringsRenderKey = this._computeStringsRenderKey(strings);
 
       const esc = (s) =>
@@ -6797,16 +9804,20 @@
                 </label>
               </div>
 
-              <label class="ed-mini-field">
+              <div class="ed-mini-field">
                 <span>Ist-Sensor für diesen String (optional)</span>
-                <input
-                  type="text"
-                  list="ed-pv-entities"
-                  value="${esc(str.actual_entity)}"
-                  data-str-entity="${idx}"
-                  placeholder="z. B. sensor.deye_pv2_power (für Pro-String-Kalibrierung &amp; Ist)"
-                />
-              </label>
+                <div class="ed-entity-combo" data-str-combo="${idx}">
+                  <input
+                    type="text"
+                    autocomplete="off"
+                    value="${esc(str.actual_entity)}"
+                    data-str-entity="${idx}"
+                    placeholder="z. B. sensor.deye_pv2_power (für Pro-String-Kalibrierung &amp; Ist)"
+                  />
+                  <button type="button" class="ed-entity-toggle" tabindex="-1" aria-expanded="false" aria-label="PV-Sensoren anzeigen">▾</button>
+                  <div class="ed-entity-menu" hidden></div>
+                </div>
+              </div>
 
               <details class="ed-str-shade-details" data-str-shade-details="${idx}"${isOpen ? ' open' : ''}>
                 <summary>
@@ -6907,10 +9918,9 @@
         });
       });
 
-      listEl.querySelectorAll('[data-str-entity]').forEach((inp) => {
-        inp.addEventListener('input', (e) => {
-          const idx = Number(inp.getAttribute('data-str-entity'));
-          const val = e.target.value.trim();
+      listEl.querySelectorAll('[data-str-combo]').forEach((comboEl) => {
+        const idx = Number(comboEl.getAttribute('data-str-combo'));
+        this._bindEntityCombo(comboEl, 'pv', (val) => {
           updateStringField(idx, (s) => {
             s.actual_entity = val;
           });
@@ -7552,6 +10562,154 @@
             outline: none;
             border-color: var(--primary-color, #38bdf8);
           }
+          input.ed-input-missing {
+            border-color: rgba(245, 158, 11, 0.72);
+          }
+          .ed-req-mark {
+            color: #fbbf24;
+            font-weight: 700;
+          }
+          .ed-req-state {
+            font-size: 11px;
+            font-weight: 600;
+          }
+          .ed-req-state.missing {
+            color: #fbbf24;
+          }
+          .ed-req-state.ok {
+            color: #34d399;
+          }
+          .ed-req-hint {
+            font-size: 11px;
+            color: var(--secondary-text-color, #94a3b8);
+            line-height: 1.35;
+          }
+          .ed-req-hint.missing {
+            color: #fcd34d;
+          }
+          .ed-entity-combo {
+            position: relative;
+            display: flex;
+            align-items: center;
+          }
+          .ed-entity-combo.open {
+            z-index: 85;
+          }
+          .ed-entity-combo input[type="text"] {
+            padding-right: 32px;
+          }
+          .ed-entity-toggle {
+            position: absolute;
+            right: 4px;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 24px;
+            height: 24px;
+            border: none;
+            border-radius: 6px;
+            background: transparent;
+            color: var(--secondary-text-color, #94a3b8);
+            font-size: 12px;
+            line-height: 1;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+          }
+          .ed-entity-toggle:hover {
+            background: rgba(255, 255, 255, 0.08);
+            color: #f8fafc;
+          }
+          .ed-entity-combo.open .ed-entity-toggle {
+            color: var(--primary-color, #38bdf8);
+            transform: translateY(-50%) rotate(180deg);
+          }
+          .ed-entity-menu {
+            position: absolute;
+            left: 0;
+            right: 0;
+            top: calc(100% + 4px);
+            z-index: 90;
+            max-height: 220px;
+            overflow-y: auto;
+            overscroll-behavior: contain;
+            background: var(--card-background-color, #0f172a);
+            border: 1px solid rgba(56, 189, 248, 0.35);
+            border-radius: 9px;
+            box-shadow: 0 14px 30px rgba(0, 0, 0, 0.65);
+            padding: 4px;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+          }
+          .ed-entity-menu[hidden] {
+            display: none;
+          }
+          .ed-entity-item {
+            width: 100%;
+            border: none;
+            background: transparent;
+            color: var(--primary-text-color, #e2e8f0);
+            border-radius: 6px;
+            padding: 7px 9px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            text-align: left;
+            cursor: pointer;
+            font-family: inherit;
+          }
+          .ed-entity-item:hover,
+          .ed-entity-item.highlighted {
+            background: rgba(56, 189, 248, 0.16);
+          }
+          .ed-entity-item.selected {
+            background: rgba(56, 189, 248, 0.22);
+            outline: 1px solid rgba(56, 189, 248, 0.45);
+          }
+          .ed-entity-item.ed-entity-clear {
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+            margin-bottom: 2px;
+            border-radius: 6px 6px 0 0;
+          }
+          .ed-entity-item.ed-entity-clear .ed-entity-name {
+            color: #fca5a5;
+          }
+          .ed-entity-main {
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            gap: 1px;
+          }
+          .ed-entity-name {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--primary-text-color, #f8fafc);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+          }
+          .ed-entity-id {
+            font-size: 10px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            color: var(--secondary-text-color, #94a3b8);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+          }
+          .ed-entity-val {
+            font-size: 10px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            color: #7dd3fc;
+            white-space: nowrap;
+            flex-shrink: 0;
+          }
+          .ed-entity-empty {
+            padding: 9px 10px;
+            font-size: 11px;
+            color: var(--secondary-text-color, #94a3b8);
+          }
           input[type="range"] {
             width: 100%;
             accent-color: var(--primary-color, #38bdf8);
@@ -7901,79 +11059,6 @@
                 </div>
               </div>
             </div>
-          </div>
-
-          <div class="ed-section">
-            <div class="ed-section-head">
-              <span>Sensoren &amp; Wetterdaten</span>
-            </div>
-
-            <div class="ed-field">
-              <div class="ed-label-row">
-                <label for="ed-actual-entity">pv_actual_entity (Gesamt-Ist Sensor, optional)</label>
-              </div>
-              <input
-                id="ed-actual-entity"
-                type="text"
-                list="ed-pv-entities"
-                placeholder="Leer lassen = Summe der String-Sensoren"
-              />
-              <div class="ed-toggle-sub">
-                Leer lassen, um automatisch die Summe aller oben gesetzten String-Sensoren als Ist-Kurve anzuzeigen.
-              </div>
-              <datalist id="ed-pv-entities"></datalist>
-            </div>
-
-            <div class="ed-field">
-              <div class="ed-label-row">
-                <label for="ed-weather-entity">weather_entity (Met.no für Temp. &amp; Wolken, optional)</label>
-              </div>
-              <input
-                id="ed-weather-entity"
-                type="text"
-                list="ed-weather-entities"
-                placeholder="z. B. weather.forecast_home"
-              />
-              <datalist id="ed-weather-entities"></datalist>
-            </div>
-          </div>
-
-          <details class="ed-details" id="ed-global-shading-details">
-            <summary>
-              <span>Globale Verschattung (Fallback)</span>
-              <span class="ed-str-shade-meta"><span id="ed-global-shade-badge">Inaktiv</span> ▼</span>
-            </summary>
-            <div class="ed-details-body">
-              <div class="ed-toggle-sub">
-                Greift nur für Strings ohne eigene Kalibrierung. Bei unterschiedlichen Schatten pro String bitte oben direkt im jeweiligen String kalibrieren.
-              </div>
-              <div class="ed-calib-row">
-                <input id="ed-calib-date" type="date" aria-label="Sonnentag für globale Kalibrierung" />
-                <button type="button" class="ed-action-btn" id="ed-calib-btn">
-                  Global kalibrieren
-                </button>
-              </div>
-              <div class="ed-calib-status" id="ed-calib-status"></div>
-              <div id="ed-shading-list"></div>
-              <div class="ed-shade-footer">
-                <button type="button" class="ed-ghost-btn" id="ed-add-shade">+ Sektor manuell</button>
-                <button type="button" class="ed-ghost-btn" id="ed-clear-shade">Alle löschen</button>
-              </div>
-            </div>
-          </details>
-
-          <div class="ed-section">
-            <div class="ed-section-head">
-              <span>PV-Anzeige &amp; Verlauf</span>
-            </div>
-
-            <label class="ed-toggle">
-              <div>
-                <div class="ed-toggle-title">show_pv_panel</div>
-                <div class="ed-toggle-sub">PV-Prognose, Ertragsgraph &amp; 24h-Verlauf</div>
-              </div>
-              <input id="ed-show-pv" type="checkbox" />
-            </label>
 
             <label class="ed-toggle">
               <div>
@@ -7983,6 +11068,79 @@
               <input id="ed-hide-night" type="checkbox" />
             </label>
           </div>
+
+          <div class="ed-section">
+            <div class="ed-section-head">
+              <span>Sensoren &amp; Wetterdaten</span>
+            </div>
+
+            <div class="ed-field">
+              <div class="ed-label-row">
+                <label for="ed-actual-entity">pv_actual_entity (Ist-Kurve Sensor) <span class="ed-req-mark">*</span></label>
+                <span class="ed-req-state missing" id="ed-actual-req-state">Pflichtfeld fehlt</span>
+              </div>
+              <div class="ed-entity-combo" id="ed-actual-combo">
+                <input
+                  id="ed-actual-entity"
+                  type="text"
+                  autocomplete="off"
+                  required
+                  placeholder="z. B. sensor.pv_power_total"
+                />
+                <button type="button" class="ed-entity-toggle" tabindex="-1" aria-expanded="false" aria-label="PV-Sensoren anzeigen">▾</button>
+                <div class="ed-entity-menu" hidden></div>
+              </div>
+              <div class="ed-req-hint missing" id="ed-actual-entity-hint">
+                Bitte einen PV-Leistungssensor (W oder kW) für die Ist-Kurve eintragen.
+              </div>
+            </div>
+
+            <div class="ed-field">
+              <div class="ed-label-row">
+                <label for="ed-weather-entity">weather_entity (Met.no für Temp. &amp; Wolken, optional)</label>
+              </div>
+              <div class="ed-entity-combo" id="ed-weather-combo">
+                <input
+                  id="ed-weather-entity"
+                  type="text"
+                  autocomplete="off"
+                  placeholder="z. B. weather.forecast_home"
+                />
+                <button type="button" class="ed-entity-toggle" tabindex="-1" aria-expanded="false" aria-label="Wetter-Entitäten anzeigen">▾</button>
+                <div class="ed-entity-menu" hidden></div>
+              </div>
+            </div>
+          </div>
+
+          <details class="ed-details" id="ed-battery-details" open>
+            <summary>
+              <span>Batteriespeicher</span>
+              <span class="ed-str-shade-meta"><span id="ed-batt-badge">Inaktiv</span> ▼</span>
+            </summary>
+            <div class="ed-details-body">
+              <label class="ed-toggle">
+                <div>
+                  <div class="ed-toggle-title">Speicher-Analyse aktiv</div>
+                  <div class="ed-toggle-sub">Batterie-Prognose &amp; Ist-Vergleich anzeigen</div>
+                </div>
+                <input id="ed-batt-enabled" type="checkbox" />
+              </label>
+
+              <label class="ed-mini-field">
+                <span>Kapazität (kWh)</span>
+                <input id="ed-batt-cap" type="number" min="0" max="300" step="0.5" placeholder="z. B. 70" />
+              </label>
+
+              <div class="ed-field">
+                <div class="ed-label-row"><label for="ed-batt-soc-entity">soc_entity (Live-SoC Sensor in %)</label></div>
+                <div class="ed-entity-combo" id="ed-batt-soc-combo">
+                  <input id="ed-batt-soc-entity" type="text" autocomplete="off" placeholder="z. B. sensor.battery_soc" />
+                  <button type="button" class="ed-entity-toggle" tabindex="-1" aria-expanded="false" aria-label="SoC-Sensoren anzeigen">▾</button>
+                  <div class="ed-entity-menu" hidden></div>
+                </div>
+              </div>
+            </div>
+          </details>
 
           <div class="ed-section">
             <div class="ed-section-head">
@@ -8110,7 +11268,6 @@
 
       on('ed-auto-play', 'change', (e) => this._updateRootField('auto_play', e.target.checked));
       on('ed-show-radar', 'change', (e) => this._updateRootField('show_radar', e.target.checked));
-      on('ed-show-pv', 'change', (e) => this._updateRootField('show_pv_panel', e.target.checked));
       on('ed-show-map', 'change', (e) => this._updateRootField('show_map', e.target.checked));
       on('ed-hide-night', 'change', (e) => this._updateRootField('hide_night', e.target.checked));
       on('ed-show-clouds', 'change', (e) => this._updateRootField('show_clouds', e.target.checked));
@@ -8160,34 +11317,72 @@
       };
       bindCoord('ed-lat', 'latitude');
       bindCoord('ed-lon', 'longitude');
-      on('ed-actual-entity', 'input', (e) => {
-        const v = e.target.value.trim();
-        this._updateRootField('pv_actual_entity', v, true);
-      });
-      on('ed-weather-entity', 'input', (e) => {
-        const v = e.target.value.trim();
-        this._updateRootField('weather_entity', v, true);
-      });
-      on('ed-global-shading-details', 'toggle', () => {
-        this._globalDetailsUserToggled = true;
-      });
-      on('ed-calib-btn', 'click', () => this._runSunnyDayCalibration());
-      on('ed-add-shade', 'click', () => {
-        const cur = normalizePvShadingConfig(this._config.pv_shading);
-        cur.push({
-          from_azimuth: 205,
-          to_azimuth: 260,
-          min_elevation: 16,
-          transmission: 0.15,
-          label: 'Nachmittag (SW)',
+      this._bindEntityCombo(
+        this.shadowRoot.getElementById('ed-actual-combo'),
+        'pv',
+        (val) => this._updateRootField('pv_actual_entity', val, true)
+      );
+      this._bindEntityCombo(
+        this.shadowRoot.getElementById('ed-weather-combo'),
+        'weather',
+        (val) => this._updateRootField('weather_entity', val, true)
+      );
+
+      const updateBatt = (mutator) => {
+        const cur = normalizeBatterySystemConfig(this._config.battery_system);
+        mutator(cur);
+        const next = { ...this._config, battery_system: cur };
+        if (!next.type) next.type = `custom:${CARD_TAG}`;
+        this._emitConfig(next);
+        this._syncInputs();
+      };
+
+      on('ed-batt-enabled', 'change', (e) =>
+        updateBatt((b) => {
+          b.enabled = e.target.checked;
+          if (b.enabled && (!b.capacity_kwh || b.capacity_kwh <= 0)) b.capacity_kwh = 10.0;
+        })
+      );
+      on('ed-batt-cap', 'input', (e) => {
+        const val = parseFloat(e.target.value);
+        updateBatt((b) => {
+          b.capacity_kwh = Number.isFinite(val) && val > 0 ? val : 0;
+          b.enabled = b.capacity_kwh > 0;
         });
-        this._updateShadingSectors(cur);
       });
-      on('ed-clear-shade', 'click', () => {
-        this._calibStatus = '';
-        this._calibError = false;
-        this._updateShadingSectors([], '');
-      });
+      on('ed-batt-min-soc', 'input', (e) =>
+        updateBatt((b) => {
+          b.min_soc_pct = Math.min(85, Math.max(0, Number(e.target.value) || 0));
+        })
+      );
+      on('ed-batt-max-chg', 'input', (e) =>
+        updateBatt((b) => {
+          b.max_charge_kw = Math.max(0.2, Number(e.target.value) || 5);
+        })
+      );
+      on('ed-batt-max-dis', 'input', (e) =>
+        updateBatt((b) => {
+          b.max_discharge_kw = Math.max(0.2, Number(e.target.value) || 5);
+        })
+      );
+      on('ed-batt-eff', 'input', (e) =>
+        updateBatt((b) => {
+          b.efficiency_pct = Math.min(99, Math.max(65, Number(e.target.value) || 92));
+        })
+      );
+      on('ed-batt-init-soc', 'input', (e) =>
+        updateBatt((b) => {
+          b.initial_soc_pct = Math.min(100, Math.max(0, Number(e.target.value) || 0));
+        })
+      );
+      this._bindEntityCombo(
+        this.shadowRoot.getElementById('ed-batt-soc-combo'),
+        'soc',
+        (val) =>
+          updateBatt((b) => {
+            b.soc_entity = val;
+          })
+      );
     }
   }
 
@@ -8204,7 +11399,7 @@
       type: CARD_TAG,
       name: 'PV-Cockpit',
       description:
-        'PV-Ertragsprognose, Idealkurve, Verschattungskalibrierung, Ist-Abgleich & optionales Wetterradar (Open-Meteo, ZAMG, Met.no, DWD, RainViewer)',
+        'PV-Ertragsprognose, Batteriespeicher-Analyse (Tagesbilanz, 6-Tage Lade-Prognose, 30-Tage Bilanz), Idealkurve, Verschattungskalibrierung, Ist-Abgleich & optionales Wetterradar',
       preview: true,
     });
   }
